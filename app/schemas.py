@@ -34,6 +34,9 @@ class BotCreate(BaseModel):
     # bot's total trades reaches this, it auto-pauses regardless of how
     # it's performing. None/0 = no limit.
     max_trades: Optional[int] = Field(default=None, ge=0)
+    # "improve to place often that work" — how many positions this bot may
+    # hold at once. 1 keeps the original one-trade-at-a-time behaviour.
+    max_open_positions: Optional[int] = Field(default=1, ge=1, le=10)
     # "can i create a bot that confirms from all or selected strategies" —
     # Confluence mode. When confluence_strategies has 2+ entries, `strategy`
     # must be the literal "CONFLUENCE" marker (see tasks.py) and the bot
@@ -85,6 +88,7 @@ class BotUpdate(BaseModel):
     cooldown_minutes: Optional[int] = Field(default=None, ge=0)
     auto_pause_after_losses: Optional[int] = Field(default=None, ge=0)
     max_trades: Optional[int] = Field(default=None, ge=0)
+    max_open_positions: Optional[int] = Field(default=None, ge=1, le=10)
     confluence_strategies: Optional[List[str]] = None
     confluence_min_agree: Optional[int] = Field(default=None, ge=1)
 
@@ -134,6 +138,20 @@ class TradeCreate(BaseModel):
     limit_price: Optional[float] = Field(default=None, gt=0)
     stop_loss: Optional[float] = Field(default=None, gt=0)
     take_profit: Optional[float] = Field(default=None, gt=0)
+    # "when i place a trade add option to execute in binance" — DEMO (the
+    # default) fills against the app's paper wallet exactly as before;
+    # BINANCE sends a real signed market order to the connected account.
+    # Defaulting to DEMO is deliberate: an omitted or unrecognised venue
+    # must never silently spend real money.
+    venue: str = "DEMO"
+
+    @field_validator("venue")
+    @classmethod
+    def venue_valid(cls, v):
+        v = (v or "DEMO").upper()
+        if v not in ("DEMO", "BINANCE"):
+            raise ValueError("venue must be DEMO or BINANCE")
+        return v
 
     @field_validator("side")
     @classmethod

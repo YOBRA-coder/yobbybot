@@ -222,6 +222,36 @@ MIGRATIONS = [
     #    more often since it isn't waiting on every strategy to line up.
     ("bots", "confluence_strategies", "TEXT DEFAULT NULL"),
     ("bots", "confluence_min_agree", "INTEGER DEFAULT NULL"),
+    # "improve to place often that work" — the other half of the
+    # low-trade-count problem (the first half being oversized stops; see
+    # services/backtest.py). bot_simulation_loop hard-coded "skip this bot
+    # if ANY trade of its is still open", so a bot could hold exactly one
+    # position at a time, forever, with no way to change that. Over five
+    # days that caps a bot at roughly (days / average-hold-time) trades no
+    # matter how many valid setups its strategy saw and rejected.
+    #
+    # Defaults to 1 so existing bots behave exactly as before until the
+    # user raises it. Note each concurrent position draws from the same
+    # bot.capital pool, so raising this splits capital across positions
+    # rather than multiplying exposure — the per-trade size still comes
+    # from risk_per_trade.
+    ("bots", "max_open_positions", "INTEGER DEFAULT 1"),
+    # "improve binance connection when i place when i close when i update"
+    #
+    # For a LIVE trade, stop-loss and take-profit used to exist ONLY inside
+    # this app — position_monitor_loop watched price and fired a market
+    # order when a level was touched. If the backend was stopped, mid-
+    # restart, or had lost its market feed, a real position sat completely
+    # unprotected. These columns record the OCO (one-cancels-other) pair
+    # actually resting on Binance, so the exchange enforces the exit whether
+    # or not this app is running:
+    #  - exchange_order_list_id: the OCO's orderListId, used to cancel and
+    #    replace it when the user edits TP/SL, and to cancel it before a
+    #    manual close so a stale order can't sell a position twice.
+    #  - exchange_exit_error: why placing it failed, if it did — surfaced in
+    #    the UI so "your stop is NOT on the exchange" is never silent.
+    ("trades", "exchange_order_list_id", "TEXT DEFAULT NULL"),
+    ("trades", "exchange_exit_error", "TEXT DEFAULT NULL"),
 ]
 
 

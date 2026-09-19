@@ -57,6 +57,46 @@ async def account_summary(user=Depends(get_current_user)):
                     )
             except Exception as e:
                 result["live_error"] = f"Could not reach Binance: {e}"
+
+    # "add binance balance or p and l for binance account first in top bar"
+    #
+    # Equity alone doesn't answer "am I up or down" — it's just a number
+    # that also moves when you deposit or withdraw. This is the P&L of the
+    # LIVE trades this app actually placed: realized from closed ones,
+    # mark-to-market from open ones.
+    #
+    # Deliberately scoped to trades with live=1 that were opened HERE. Any
+    # position you opened directly in the Binance app is invisible to this
+    # figure, because the app has no entry price for it — reconciling that
+    # properly needs a myTrades history pull per symbol, which is a
+    # separate job. The equity number above does include those holdings, so
+    # the two are answering different questions on purpose.
+    conn = get_db()
+    closed_rows = conn.execute(
+        "SELECT pnl FROM trades WHERE user_id=? AND live=1 AND status='CLOSED'",
+        (user["id"],),
+    ).fetchall()
+    open_rows = conn.execute(
+        "SELECT pair, side, price, amount FROM trades WHERE user_id=? AND live=1 AND status='FILLED'",
+        (user["id"],),
+    ).fetchall()
+    conn.close()
+
+    realized = sum(r["pnl"] or 0 for r in closed_rows)
+    unrealized = 0.0
+    for r in open_rows:
+        mark = live_prices.get(r["pair"])
+        if not mark:
+            continue
+        unrealized += ((mark - r["price"]) if r["side"] == "BUY" else (r["price"] - mark)) * r["amount"]
+
+    result["live_pnl"] = {
+        "realized": realized,
+        "unrealized": unrealized,
+        "total": realized + unrealized,
+        "open_positions": len(open_rows),
+        "closed_trades": len(closed_rows),
+    }
     return result
 
 

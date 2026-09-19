@@ -1,11 +1,35 @@
 import time
 
+import aiohttp
 from fastapi import APIRouter, Depends, HTTPException
 
+from ..crypto import decrypt
 from ..database import get_db
 from ..schemas import TradeCreate, TradeUpdate
 from ..security import get_current_user
+from ..services.binance_client import (
+    cancel_order_list, extract_fill, place_market_order, place_oco_exit,
+)
 from ..services.market import live_tickers
+
+
+def _broker_creds(user):
+    """
+    Decrypts the user's stored Binance credentials, or raises a clear 4xx
+    explaining exactly what to do about it.
+
+    Every real-money path in this router goes through here rather than
+    each doing its own half-check, so "Binance isn't connected" can never
+    quietly degrade into "filled on the paper wallet instead" — placing a
+    real order and placing a simulated one must never be confusable.
+    """
+    if not (user["binance_api_key_enc"] and user["binance_api_secret_enc"]):
+        raise HTTPException(400, "Binance is not connected — add your API keys in Settings first")
+    api_key = decrypt(user["binance_api_key_enc"])
+    api_secret = decrypt(user["binance_api_secret_enc"])
+    if not api_key or not api_secret:
+        raise HTTPException(400, "Stored Binance credentials could not be decrypted — please reconnect in Settings")
+    return api_key, api_secret, bool(user["binance_testnet"])
 
 router = APIRouter(prefix="/trades", tags=["trades"])
 
@@ -66,25 +90,90 @@ async def place_trade(req: TradeCreate, user=Depends(get_current_user)):
             raise HTTPException(400, f"Take profit ({req.take_profit}) must be below entry price ({price}) for a SELL")
 
     tid = f"t_{int(time.time()*1000)}"
-    total = price * req.amount
-    fee = total * 0.001
+    is_live = req.venue == "BINANCE"
+    exchange_order_list_id = None
+    exchange_exit_error = None
+
+    # "when i place a trade add option to execute in binance" — a BINANCE
+    # order is sent to the exchange BEFORE anything is written to the
+    # database, and the row records the actual fill Binance reported, not
+    # the price we quoted off the ticker cache. A market order routinely
+    # fills a few ticks away from the last trade price, and a partial fill
+    # changes the quantity too; recording our own estimate would leave the
+    # app's P&L permanently disagreeing with the exchange's.
+    #
+    # If the exchange rejects the order, nothing is recorded at all — a
+    # trade that never happened must not appear in history.
+    if is_live:
+        if req.order_type == "limit":
+            raise HTTPException(
+                400,
+                "Live Binance orders are market-only right now — place this as a market order, "
+                "or use the demo venue for limit orders.",
+            )
+        api_key, api_secret, testnet = _broker_creds(user)
+        try:
+            async with aiohttp.ClientSession() as session:
+                order = await place_market_order(
+                    session, api_key, api_secret, testnet, req.pair, req.side, req.amount
+                )
+        except Exception as e:
+            raise HTTPException(502, f"Binance rejected the order: {e}")
+        fill = extract_fill(order)
+        if not fill:
+            raise HTTPException(502, "Binance accepted the order but reported no fill — check your exchange order history before retrying")
+        price = fill["avg_price"]
+        amount = fill["executed_qty"]
+        fee = fill["commission"] or price * amount * 0.001
+        total = price * amount
+
+        # Put the exits on the exchange itself, so they survive this app
+        # being down. Only possible when BOTH levels are given — Binance's
+        # OCO needs a take-profit leg and a stop leg. A failure here is NOT
+        # fatal (the position is already open and must be recorded), but it
+        # is recorded and surfaced rather than silently leaving the trade
+        # protected only by the in-app monitor.
+        if req.stop_loss and req.take_profit:
+            try:
+                async with aiohttp.ClientSession() as session:
+                    oco = await place_oco_exit(
+                        session, api_key, api_secret, testnet,
+                        req.pair, req.side, amount, req.take_profit, req.stop_loss,
+                    )
+                exchange_order_list_id = str(oco.get("orderListId")) if oco.get("orderListId") is not None else None
+            except Exception as e:
+                exchange_exit_error = str(e)
+        elif req.stop_loss or req.take_profit:
+            exchange_exit_error = (
+                "Binance needs both a stop loss AND a take profit to hold an exit order. "
+                "Only one was set, so this level is monitored by the app instead."
+            )
+    else:
+        amount = req.amount
+        total = price * amount
+        fee = total * 0.001
+
     cost = total + fee
 
     conn = get_db()
-    # This is the demo/paper wallet — placing a trade actually spends from
-    # it now. Previously users.balance existed but nothing ever read or
-    # wrote it, so the number never moved no matter what you traded.
-    if user["balance"] < cost:
+    # Demo/paper wallet. A LIVE order spends real funds on the exchange and
+    # must NOT also be deducted from the paper balance — that would
+    # double-count the same position and make the demo number drift for
+    # reasons that have nothing to do with demo trading.
+    if not is_live and user["balance"] < cost:
         conn.close()
         raise HTTPException(400, f"Insufficient balance: need ${cost:.2f}, have ${user['balance']:.2f}")
 
+    reason = "Manual order executed on Binance" if is_live else "Manual order placed by user"
     conn.execute(
-        """INSERT INTO trades (id,user_id,pair,side,price,amount,total,fee,pnl,stop_loss,take_profit,status,reason)
-        VALUES (?,?,?,?,?,?,?,?,0,?,?,'FILLED',?)""",
-        (tid, user["id"], req.pair, req.side, price, req.amount, total, fee, req.stop_loss, req.take_profit,
-         "Manual order placed by user"),
+        """INSERT INTO trades (id,user_id,pair,side,price,amount,total,fee,pnl,stop_loss,take_profit,live,status,reason,
+                               exchange_order_list_id,exchange_exit_error)
+        VALUES (?,?,?,?,?,?,?,?,0,?,?,?,'FILLED',?,?,?)""",
+        (tid, user["id"], req.pair, req.side, price, amount, total, fee, req.stop_loss, req.take_profit,
+         int(is_live), reason, exchange_order_list_id, exchange_exit_error),
     )
-    conn.execute("UPDATE users SET balance = balance - ? WHERE id=?", (cost, user["id"]))
+    if not is_live:
+        conn.execute("UPDATE users SET balance = balance - ? WHERE id=?", (cost, user["id"]))
     conn.commit()
     new_balance = conn.execute("SELECT balance FROM users WHERE id=?", (user["id"],)).fetchone()["balance"]
     conn.close()
@@ -96,11 +185,17 @@ async def place_trade(req: TradeCreate, user=Depends(get_current_user)):
     # those to state.
     return {
         "id": tid, "pair": req.pair, "side": req.side, "price": price,
-        "amount": req.amount, "total": total, "fee": fee, "pnl": 0,
+        "amount": amount, "total": total, "fee": fee, "pnl": 0,
         "stop_loss": req.stop_loss, "take_profit": req.take_profit,
-        "reason": "Manual order placed by user",
+        "reason": reason, "live": int(is_live),
         "status": "FILLED", "timestamp": int(time.time() * 1000),
         "balance": new_balance,
+        # Where the exits actually live: "EXCHANGE" means Binance is holding
+        # a resting OCO and will enforce it even if this app is offline;
+        # "APP" means only position_monitor_loop is watching.
+        "sl_tp_venue": "EXCHANGE" if exchange_order_list_id else "APP",
+        "exchange_order_list_id": exchange_order_list_id,
+        "exchange_exit_error": exchange_exit_error,
     }
 
 
@@ -143,10 +238,58 @@ async def update_trade_tp_sl(trade_id: str, req: TradeUpdate, user=Depends(get_c
             conn.close()
             raise HTTPException(400, f"Take profit ({new_tp}) must be below entry price ({entry}) for a SELL")
 
-    conn.execute("UPDATE trades SET stop_loss=?, take_profit=? WHERE id=?", (new_sl, new_tp, trade_id))
+    # For a LIVE trade, the levels aren't just a database row — there may be
+    # a real OCO resting on Binance enforcing the OLD ones. Editing without
+    # replacing it would leave the exchange protecting the position at
+    # levels the user can no longer see anywhere in the UI. Cancel, then
+    # re-place at the new levels.
+    exchange_order_list_id = trade["exchange_order_list_id"]
+    exchange_exit_error = None
+    if trade["live"]:
+        api_key, api_secret, testnet = _broker_creds(user)
+        async with aiohttp.ClientSession() as session:
+            if exchange_order_list_id:
+                try:
+                    await cancel_order_list(
+                        session, api_key, api_secret, testnet, trade["pair"], int(exchange_order_list_id)
+                    )
+                except Exception as e:
+                    # Refuse rather than proceed: if the old OCO is still
+                    # live and we place a second one, the account ends up
+                    # with two resting exits for one position, and whichever
+                    # fires second sells a position that no longer exists.
+                    conn.close()
+                    raise HTTPException(
+                        502,
+                        f"Could not cancel the existing Binance exit order, so TP/SL was not changed: {e}",
+                    )
+                exchange_order_list_id = None
+            if new_sl and new_tp:
+                try:
+                    oco = await place_oco_exit(
+                        session, api_key, api_secret, testnet,
+                        trade["pair"], trade["side"], trade["amount"], new_tp, new_sl,
+                    )
+                    exchange_order_list_id = str(oco.get("orderListId")) if oco.get("orderListId") is not None else None
+                except Exception as e:
+                    exchange_exit_error = str(e)
+            else:
+                exchange_exit_error = (
+                    "Binance needs both a stop loss AND a take profit to hold an exit order — "
+                    "this level is monitored by the app instead."
+                )
+
+    conn.execute(
+        "UPDATE trades SET stop_loss=?, take_profit=?, exchange_order_list_id=?, exchange_exit_error=? WHERE id=?",
+        (new_sl, new_tp, exchange_order_list_id, exchange_exit_error, trade_id),
+    )
     conn.commit()
     updated = dict(conn.execute("SELECT * FROM trades WHERE id=?", (trade_id,)).fetchone())
     conn.close()
+    # Tells the client whether Binance is actually holding these levels or
+    # whether only this app is watching them — so the UI can say so plainly
+    # instead of implying the exchange has the order.
+    updated["sl_tp_venue"] = "EXCHANGE" if exchange_order_list_id else "APP"
     return updated
 
 
@@ -187,6 +330,50 @@ async def close_trade(trade_id: str, user=Depends(get_current_user)):
             "unreachable) — try closing again in a moment.",
         )
     close_price = ticker["price"]
+
+    # BUG FIX: a LIVE trade closed from the UI only ever updated this row.
+    # The actual position stayed open on Binance — the app said "closed",
+    # the exchange disagreed, and the next SL/TP sweep or a manual exchange
+    # close would settle it a second time. Closing a live trade now sends
+    # the opposite market order first and settles at the real fill; if the
+    # exchange rejects it, the row is left open rather than being marked
+    # closed against a position that still exists.
+    if trade["live"]:
+        api_key, api_secret, testnet = _broker_creds(user)
+        closing_side = "SELL" if trade["side"] == "BUY" else "BUY"
+        try:
+            async with aiohttp.ClientSession() as session:
+                # Cancel the resting OCO FIRST. Skipping this leaves a stop
+                # and a take-profit sitting on the exchange for a position
+                # that's about to stop existing — whichever one later
+                # triggers would open an unintended new position in the
+                # opposite direction.
+                if trade["exchange_order_list_id"]:
+                    try:
+                        await cancel_order_list(
+                            session, api_key, api_secret, testnet,
+                            trade["pair"], int(trade["exchange_order_list_id"]),
+                        )
+                    except Exception as e:
+                        conn.close()
+                        raise HTTPException(
+                            502,
+                            f"Could not cancel the Binance exit order, so the position was NOT closed "
+                            f"(closing it with the stop still resting would leave a stray order): {e}",
+                        )
+                order = await place_market_order(
+                    session, api_key, api_secret, testnet, trade["pair"], closing_side, trade["amount"]
+                )
+        except HTTPException:
+            raise
+        except Exception as e:
+            conn.close()
+            raise HTTPException(502, f"Binance rejected the closing order — position is still open: {e}")
+        fill = extract_fill(order)
+        if fill:
+            close_price = fill["avg_price"]
+        conn.execute("UPDATE trades SET exchange_order_list_id=NULL WHERE id=?", (trade_id,))
+
     pnl = ((close_price - trade["price"]) if trade["side"] == "BUY" else (trade["price"] - close_price)) * trade["amount"]
     pnl -= trade["fee"]
 

@@ -14,7 +14,7 @@ these presets it maps to, and doubles as the description shown in the UI.
 import math
 from typing import List, TypedDict
 
-from .indicators import calc_bb, calc_ema, calc_macd, calc_rsi
+from .indicators import calc_atr, calc_bb, calc_ema, calc_macd, calc_rsi
 
 PRESETS = ("RSI Scalper", "EMA Cross", "MACD Divergence", "Bollinger Squeeze", "Grid Trading")
 
@@ -434,6 +434,10 @@ def evaluate_confluence_live(strategy_names: List[str], candles: List[dict], min
     }
 
 
+def _clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
 def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: dict = None):
     """
     Live, point-in-time version of a preset's ENTRY rule — the exact same
@@ -468,6 +472,24 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
     closes = [c["close"] for c in candles]
     price = closes[-1]
     entered, reason = False, ""
+    # BUG FIX ("trades placed frequently depending on market"): every
+    # preset used to report a flat confidence of 75 the instant its
+    # condition fired at all — a razor-thin RSI dip that JUST crossed
+    # oversold scored identically to a deep, decisive one. Two consequences:
+    #  1. `confidence_threshold` (the UI slider goes to 95) could never
+    #     actually filter for stronger vs weaker setups — it was purely
+    #     on/off at 75, so a bot set above 75 would silently place ZERO
+    #     trades forever, with no error explaining why.
+    #  2. Trade frequency had no real relationship to how convincing the
+    #     market's move actually was — a bot fired the same whether the
+    #     signal barely qualified or blew through the threshold.
+    # Each branch below now scores confidence from HOW FAR PAST its
+    # threshold the condition is, clamped to 60-95. A quiet/choppy market
+    # produces mostly marginal, low-confidence signals that a sensibly-set
+    # threshold filters out; a strongly trending/volatile one produces
+    # signals that clear it — so trade frequency tracks actual market
+    # conviction instead of being a coin flip against a fixed number.
+    confidence = 0
 
     if strategy_name == "RSI Scalper":
         rsi = calc_rsi(closes)
@@ -481,6 +503,10 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
         # it kept buying dips in a falling market with nothing checking
         # whether the fall had actually paused.
         entered = rsi < oversold and rsi > prev_rsi
+        if entered:
+            depth = oversold - rsi          # how far below the line
+            turn = rsi - prev_rsi           # how sharp the bounce is
+            confidence = round(_clamp(60 + depth * 1.5 + turn * 4, 60, 95))
         reason = (
             f"RSI {rsi:.1f} — below oversold threshold {oversold} and turning up"
             if entered else f"RSI {rsi:.1f} — below oversold threshold {oversold} but still falling"
@@ -495,6 +521,10 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
         # repeated small losses.
         slow_rising = len(es) > 3 and es[-1] > es[-4]
         entered = ef[-1] > es[-1] and ef[-2] <= es[-2] and slow_rising
+        if entered:
+            spread_pct = (ef[-1] - es[-1]) / price * 100 if price else 0    # how far apart the EMAs are
+            slope_pct = (es[-1] - es[-4]) / es[-4] * 100 if es[-4] else 0   # how fast the slow EMA is rising
+            confidence = round(_clamp(60 + spread_pct * 25 + slope_pct * 40, 60, 95))
         reason = (
             f"EMA{fast} crossed above EMA{slow} in a rising trend" if entered
             else f"EMA{fast}/EMA{slow} cross condition not confirmed"
@@ -506,16 +536,33 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
         # above zero" filter — see its docstring. Filters out crosses that
         # are really just a bounce inside a deeper downtrend.
         entered = hist_prev <= 0 < hist_now and m_now["macd"] > 0
+        if entered:
+            # Size the histogram's jump against the recent average |MACD|
+            # line — the same absolute histogram value means very different
+            # things on a $1 altcoin vs $60k BTC, so this has to be
+            # relative, not a raw number.
+            recent_macd = [calc_macd(closes[:i])["macd"] for i in range(max(30, len(closes) - 20), len(closes))]
+            avg_abs = (sum(abs(v) for v in recent_macd) / len(recent_macd)) or 1
+            magnitude = abs(hist_now) / avg_abs
+            confidence = round(_clamp(60 + magnitude * 20, 60, 95))
         reason = "MACD line crossed above signal in bullish territory" if entered else "MACD cross condition not confirmed"
     elif strategy_name == "Bollinger Squeeze":
         period, std_dev = int(params.get("bbPeriod", 20)), params.get("bbStdDev", 2.0)
         bb = calc_bb(closes, period, std_dev)
         entered = price < bb["lower"] and price > candles[-1]["open"]
+        if entered:
+            band_width = bb["upper"] - bb["lower"] or 1
+            breach_pct = (bb["lower"] - price) / band_width * 100  # how far past the band, relative to its width
+            confidence = round(_clamp(60 + breach_pct * 6, 60, 95))
         reason = f"Price closed below lower Bollinger band ({period}, {std_dev}σ) on a bullish candle"
     elif strategy_name == "Grid Trading":
         grid_pct = params.get("gridPct", 1.5)
         sma = sum(closes[-20:]) / 20
         entered = price <= sma * (1 - grid_pct / 100) and price > candles[-1]["open"]
+        if entered:
+            actual_pct = (sma - price) / sma * 100 if sma else grid_pct
+            overshoot = actual_pct - grid_pct  # how far past the configured grid step
+            confidence = round(_clamp(60 + overshoot * 8, 60, 95))
         reason = f"Price {grid_pct}% below 20-period SMA on a bullish candle"
 
     if not entered:
@@ -533,7 +580,35 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
     # row with no explicit stopPct saved would backtest with a 3% stop but
     # trade live with a 2% one, a tighter stop than it was ever actually
     # tuned/tested against.
-    stop_pct = params.get("stopPct", DEFAULT_PARAMS.get(strategy_name, {}).get("stopPct", 3)) / 100
+    # `stopPct` is now a CEILING, not the stop itself. The actual stop is
+    # sized from ATR (recent real volatility on this pair AND timeframe),
+    # clamped into a sane band around it.
+    #
+    # Why this changed: a flat 3% stop is wildly different in meaning
+    # depending on the chart. On a 1d BTC chart it's a normal day; on a 15m
+    # chart it can take days to reach. Because a bot holds only one
+    # position at a time and never exits until stop or target is touched,
+    # an oversized stop meant a bot spent almost the entire week inside a
+    # single open trade — which is exactly the "5 days, 0-2 trades" symptom.
+    # Sizing the stop to ~1.2 ATR means a trade resolves in a handful of
+    # bars on whatever timeframe the bot actually trades, so the bot cycles
+    # through setups at a rate that matches its chart.
+    #
+    # This is a frequency fix, NOT a promise of more profit: a tighter stop
+    # is also easier to hit, so win RATE will typically fall even as total
+    # trades rise. What keeps the maths honest is the 1.5:1 target below —
+    # winners stay worth more than losers, so the strategy doesn't need a
+    # coin-flip-beating hit rate to come out ahead. Watch the first week's
+    # results and raise `stopPct` (or the bot's cooldown) if it's churning.
+    max_stop_pct = params.get("stopPct", DEFAULT_PARAMS.get(strategy_name, {}).get("stopPct", 3)) / 100
+    atr = calc_atr(candles)
+    if atr > 0 and price > 0:
+        atr_stop_pct = (atr * 1.2) / price
+        # Floor at 0.35% so fees (0.1% per side) can't eat a whole winner,
+        # ceiling at the strategy's own configured stopPct.
+        stop_pct = min(max(atr_stop_pct, 0.0035), max_stop_pct)
+    else:
+        stop_pct = max_stop_pct
     # BUG FIX (reward:risk): target used to be a flat 3% no matter how wide
     # or tight the stop was — pair that with a 3% stop and every trade
     # risks exactly as much as it can win, meaning even a strategy that's
@@ -547,7 +622,7 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
     # removes a stacked-against-you payoff structure that was independent
     # of how good the entries were.
     return {
-        "type": "BUY", "strength": 2, "confidence": 75,
+        "type": "BUY", "strength": 2, "confidence": confidence,
         "targetPrice": price * (1 + stop_pct * 1.5), "stopLoss": price * (1 - stop_pct),
         "reason": f'"{strategy_name}": {reason}',
     }

@@ -41,6 +41,38 @@ def calc_bb(closes: List[float], period: int = 20, std_dev: float = 2.0) -> dict
     return {"upper": mean + std_dev * std, "middle": mean, "lower": mean - std_dev * std}
 
 
+def calc_atr(candles: List[dict], period: int = 14) -> float:
+    """
+    Average True Range — the average size of a candle's full move,
+    including gaps. Used to size stops relative to what the market is
+    ACTUALLY doing on this pair/timeframe right now.
+
+    Why this exists: every preset used a flat percentage stop (default 3%).
+    On a 15m chart 3% is an enormous distance — for most majors that's
+    hours or days of range — so a bot would enter, then sit in the same
+    position for days waiting for price to travel far enough to hit either
+    the stop or the 4.5% target. With only one position open at a time,
+    that is the direct cause of "each bot has placed 0, 1 or 2 trades in
+    5 days": the bots weren't failing to find entries, they were parked in
+    a single trade the whole time. An ATR-scaled stop is proportional to
+    the timeframe being traded, so positions resolve on a timescale that
+    matches the chart the bot is reading, and the bot is free to take the
+    next setup.
+    """
+    if len(candles) < 2:
+        return 0.0
+    trs = []
+    for i in range(1, len(candles)):
+        c, p = candles[i], candles[i - 1]
+        trs.append(max(
+            c["high"] - c["low"],
+            abs(c["high"] - p["close"]),
+            abs(c["low"] - p["close"]),
+        ))
+    window = trs[-period:] if len(trs) >= period else trs
+    return sum(window) / len(window) if window else 0.0
+
+
 def generate_signal_from_ta(candles: List[dict], ticker: dict) -> dict:
     price = ticker["price"]
     # No real candle data available right now (e.g. Binance is temporarily
@@ -62,42 +94,62 @@ def generate_signal_from_ta(candles: List[dict], ticker: dict) -> dict:
     bb = calc_bb(closes)
     ema50 = calc_ema(closes, min(50, len(closes)))[-1]
     ema200 = calc_ema(closes, min(200, len(closes)))[-1]
-    score = 0
+    score = 0.0
     reasons = []
 
+    # BUG FIX ("my signals all bring 70% confidence"): every factor below
+    # used to add a FIXED integer (±1 or ±2) the instant its condition was
+    # true at all, with no regard for how strongly true it was — RSI at
+    # 44.9 scored identically to RSI at 30.1. Two of the most common
+    # factors, RSI's 45-55 "momentum" zone and the EMA50/EMA200 trend
+    # check, both fire in the overwhelming majority of real market states
+    # (the trend check is UNCONDITIONAL — it always contributes ±1 to
+    # EVERY evaluation, never zero), and both landed on exactly ±1 far
+    # more often than not. ±1 + ±1 = the minimum ±2 needed to leave HOLD at
+    # all, which floored confidence at exactly 50+2×10=70 for a huge share
+    # of all signals — not a coincidence, a structural certainty of the
+    # math. Every branch now adds its old base value PLUS a continuous
+    # bonus sized to how far past its own threshold the reading actually
+    # is, so two different market states essentially never produce the
+    # identical score, and confidence spreads out to reflect that instead
+    # of pooling at one number.
     if rsi < 30:
-        score += 2; reasons.append("RSI oversold")
+        score += 2 + min(2.5, (30 - rsi) / 10); reasons.append("RSI oversold")
     elif rsi > 70:
-        score -= 2; reasons.append("RSI overbought")
+        score -= 2 + min(2.5, (rsi - 70) / 10); reasons.append("RSI overbought")
     elif rsi < 45:
-        score += 1; reasons.append("RSI bullish momentum")
+        score += 1 + min(1.5, (45 - rsi) / 15); reasons.append("RSI bullish momentum")
     elif rsi > 55:
-        score -= 1; reasons.append("RSI bearish pressure")
+        score -= 1 + min(1.5, (rsi - 55) / 15); reasons.append("RSI bearish pressure")
 
     if macd["macd"] > macd["signal"] and macd["hist"] > 0:
-        score += 2; reasons.append("MACD bullish crossover")
+        magnitude = min(2.0, abs(macd["hist"]) / price * 10000) if price else 0  # relative, not raw — scale-free across pairs
+        score += 2 + magnitude; reasons.append("MACD bullish crossover")
     elif macd["macd"] < macd["signal"]:
-        score -= 2; reasons.append("MACD bearish crossover")
+        magnitude = min(2.0, abs(macd["hist"]) / price * 10000) if price else 0
+        score -= 2 + magnitude; reasons.append("MACD bearish crossover")
 
+    band_width = (bb["upper"] - bb["lower"]) or 1
     if price < bb["lower"]:
-        score += 2; reasons.append("Price below lower Bollinger band")
+        score += 2 + min(2.0, (bb["lower"] - price) / band_width * 5); reasons.append("Price below lower Bollinger band")
     elif price > bb["upper"]:
-        score -= 2; reasons.append("Price above upper Bollinger band")
+        score -= 2 + min(2.0, (price - bb["upper"]) / band_width * 5); reasons.append("Price above upper Bollinger band")
 
+    spread_pct = ((ema50 - ema200) / ema200 * 100) if ema200 else 0
     if ema50 > ema200:
-        score += 1; reasons.append("Uptrend confirmed (EMA50 > EMA200)")
+        score += 1 + min(1.5, spread_pct * 2); reasons.append("Uptrend confirmed (EMA50 > EMA200)")
     else:
-        score -= 1; reasons.append("Downtrend (EMA50 < EMA200)")
+        score -= 1 + min(1.5, abs(spread_pct) * 2); reasons.append("Downtrend (EMA50 < EMA200)")
 
     avg_vol = sum(volumes[-20:]) / max(1, len(volumes[-20:]))
-    if volumes and volumes[-1] > avg_vol * 1.5:
-        score += 1; reasons.append("Volume breakout")
+    if volumes and avg_vol and volumes[-1] > avg_vol * 1.5:
+        score += 1 + min(1.5, volumes[-1] / avg_vol - 1.5); reasons.append("Volume breakout")
 
     change_pct = ticker.get("changePct", 0)
     if change_pct > 3:
-        score += 1; reasons.append("Strong bullish momentum")
+        score += 1 + min(1.5, (change_pct - 3) / 3); reasons.append("Strong bullish momentum")
     elif change_pct < -3:
-        score -= 1; reasons.append("Strong bearish momentum")
+        score -= 1 + min(1.5, (abs(change_pct) - 3) / 3); reasons.append("Strong bearish momentum")
 
     # BUG FIX / tuning: this used to require a score of ±3 (out of a
     # realistic ±9 range) before ever calling BUY/SELL, which meant most
@@ -117,7 +169,7 @@ def generate_signal_from_ta(candles: List[dict], ticker: dict) -> dict:
     else:
         sig_type = "HOLD"
 
-    confidence = min(95, 50 + abs(score) * 10)
+    confidence = round(min(95, 50 + abs(score) * 10))
 
     if sig_type == "BUY":
         target, stop = price * 1.035, price * 0.975
@@ -128,7 +180,10 @@ def generate_signal_from_ta(candles: List[dict], ticker: dict) -> dict:
 
     return {
         "type": sig_type,
-        "strength": abs(score),
+        # `score` is now a float (continuous bonuses above) — round for
+        # display since "strength" reads as a small integer count/rating
+        # elsewhere (e.g. star ratings), not a raw decimal.
+        "strength": round(abs(score)),
         "confidence": confidence,
         "targetPrice": target,
         "stopLoss": stop,

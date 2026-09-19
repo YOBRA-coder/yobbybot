@@ -133,12 +133,13 @@ async def create_bot(req: BotCreate, user=Depends(get_current_user)):
         """INSERT INTO bots
         (id,user_id,name,pair,strategy,capital,mode,status,win_rate,max_hold_minutes,
          confidence_threshold,timeframe,cooldown_minutes,auto_pause_after_losses,max_trades,
-         confluence_strategies,confluence_min_agree)
-        VALUES (?,?,?,?,?,?,?,'RUNNING',0,?,?,?,?,?,?,?,?)""",
+         max_open_positions,confluence_strategies,confluence_min_agree)
+        VALUES (?,?,?,?,?,?,?,'RUNNING',0,?,?,?,?,?,?,?,?,?)""",
         (bid, user["id"], req.name, req.pair, req.strategy, req.capital, req.mode,
          req.max_hold_minutes or None, req.confidence_threshold or 65,
          req.timeframe or "15m", req.cooldown_minutes or 0, req.auto_pause_after_losses
          if req.auto_pause_after_losses is not None else 4, req.max_trades or None,
+         req.max_open_positions or 1,
          json.dumps(req.confluence_strategies) if req.confluence_strategies else None,
          req.confluence_min_agree or None),
     )
@@ -279,6 +280,11 @@ async def update_bot(bot_id: str, req: BotUpdate, user=Depends(get_current_user)
         conn.execute(
             "UPDATE bots SET max_trades=? WHERE id=? AND user_id=?",
             (req.max_trades or None, bot_id, user["id"]),
+        )
+    if req.max_open_positions is not None:
+        conn.execute(
+            "UPDATE bots SET max_open_positions=? WHERE id=? AND user_id=?",
+            (req.max_open_positions, bot_id, user["id"]),
         )
     if req.confluence_strategies is not None:
         conn.execute(

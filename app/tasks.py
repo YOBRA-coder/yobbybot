@@ -10,6 +10,38 @@ from .database import get_db, serialize_bot
 from .services.market import fetch_binance_tickers, fetch_klines
 from .ws_manager import manager
 
+# Shared by bot_simulation_loop (entry pacing) and position_monitor_loop
+# (default max-hold when a bot has none configured) — kept in one place so
+# the two can't quietly drift apart on what "one bar" means for a timeframe.
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+
+def _compute_current_position(conn, bot_id: str) -> str | None:
+    """
+    Derives a bot's displayed position from its ACTUALLY open trades,
+    rather than tracking it by hand at every entry/close call site — see
+    the note where bot entries update current_position for why that
+    became unreliable once a bot could hold more than one position at
+    once (max_open_positions). "MIXED" covers the case of simultaneous
+    long and short positions, which is possible now that a bot isn't
+    limited to one.
+    """
+    row = conn.execute(
+        """SELECT
+             SUM(CASE WHEN side='BUY' THEN 1 ELSE 0 END) AS longs,
+             SUM(CASE WHEN side='SELL' THEN 1 ELSE 0 END) AS shorts
+           FROM trades WHERE bot_id=? AND status='FILLED'""",
+        (bot_id,),
+    ).fetchone()
+    longs, shorts = row["longs"] or 0, row["shorts"] or 0
+    if longs and shorts:
+        return "MIXED"
+    if longs:
+        return "LONG"
+    if shorts:
+        return "SHORT"
+    return None
+
 
 async def market_data_loop():
     """Continuously fetch market data and broadcast to connected clients."""
@@ -145,7 +177,7 @@ async def bot_simulation_loop():
     """
     from .crypto import decrypt
     from .services.backtest import evaluate_confluence_live, evaluate_preset_live
-    from .services.binance_client import extract_fill, place_market_order
+    from .services.binance_client import extract_fill, place_market_order, place_oco_exit
     from .services.indicators import generate_signal_from_ta
     from .services.market import fetch_klines, live_tickers
 
@@ -202,8 +234,8 @@ async def bot_simulation_loop():
                     is_live = bot["mode"] == "LIVE"
 
                     already_open = conn.execute(
-                        "SELECT 1 FROM trades WHERE bot_id=? AND status='FILLED' LIMIT 1", (bot["id"],)
-                    ).fetchone()
+                        "SELECT COUNT(*) AS n FROM trades WHERE bot_id=? AND status='FILLED'", (bot["id"],)
+                    ).fetchone()["n"]
 
                     timeframe = bot["timeframe"] or "15m"
                     candles = await fetch_klines(session, bot["pair"], timeframe, TIMEFRAME_CANDLES.get(timeframe, 96))
@@ -276,8 +308,17 @@ async def bot_simulation_loop():
                     if bot["status"] != "RUNNING":
                         continue  # PAUSED: show the market read, but never open a new trade
 
-                    if already_open:
-                        continue  # position_monitor_loop will close it when SL/TP is hit
+                    # "improve to place often that work" — a bot used to be
+                    # hard-limited to exactly one open position, so its trade
+                    # count over a week was really just a function of how
+                    # long its average trade stayed open, not how many valid
+                    # setups its strategy found. max_open_positions (default
+                    # 1, so nothing changes until the user raises it) lets a
+                    # bot take the next setup while an earlier one is still
+                    # running.
+                    max_open = bot["max_open_positions"] or 1
+                    if already_open >= max_open:
+                        continue  # position_monitor_loop will close them on SL/TP
 
                     # "stop after how many trades" — a lifetime trade-count
                     # cap, separate from the consecutive-loss circuit
@@ -304,13 +345,39 @@ async def bot_simulation_loop():
                     # only with high confidence" also means not re-firing on the
                     # same signal every single 15s cycle the moment a position
                     # closes. 0 (the default) means no cooldown at all.
+                    #
+                    # BUG FIX ("concurrent positions... can create many at a
+                    # go"): that default of 0 combined with max_open_positions
+                    # > 1 meant nothing paced entries AT ALL. This loop runs
+                    # every 15s, so the moment a signal qualified, a bot with
+                    # e.g. 5 concurrent slots would fill every one of them
+                    # within about a minute — all off the same signal, at
+                    # nearly the same price. That's not "catching more
+                    # distinct setups over time", it's front-loading all the
+                    # bot's capital into one moment, which is the opposite of
+                    # what concurrent positions are for.
+                    #
+                    # Whenever this entry would be an ADDITIONAL position
+                    # (already_open > 0), a minimum spacing of one bar on the
+                    # bot's own timeframe is now enforced even if
+                    # cooldown_minutes is 0 — a genuinely new technical signal
+                    # can't arrive faster than a new candle closes anyway. A
+                    # bot capped at one position is completely unaffected:
+                    # already_open is always 0 for it by the time it reaches
+                    # here (anything else was already turned away above), so
+                    # this new floor never applies to it.
                     cooldown_minutes = bot["cooldown_minutes"] or 0
-                    if cooldown_minutes > 0:
+                    if already_open > 0:
+                        minutes_per_bar = TIMEFRAME_MINUTES.get(bot["timeframe"] or "15m", 15)
+                        min_spacing = max(cooldown_minutes, minutes_per_bar)
+                    else:
+                        min_spacing = cooldown_minutes
+                    if min_spacing > 0:
                         last_trade = conn.execute(
                             "SELECT created_at FROM trades WHERE bot_id=? ORDER BY created_at DESC LIMIT 1",
                             (bot["id"],),
                         ).fetchone()
-                        if last_trade and (time.time() - last_trade["created_at"]) / 60 < cooldown_minutes:
+                        if last_trade and (time.time() - last_trade["created_at"]) / 60 < min_spacing:
                             continue
 
                     if is_live:
@@ -339,11 +406,13 @@ async def bot_simulation_loop():
                         continue
 
                     entry_price = price
+                    exchange_order_list_id = None
+                    exchange_exit_error = None
                     if is_live:
                         try:
                             order = await place_market_order(
                                 session, api_key, api_secret, testnet,
-                                bot["pair"], ta["type"], amount,
+                                bot["pair"], ta["type"], amount, ref_price=price,
                             )
                             fill = extract_fill(order)
                             if fill:
@@ -356,6 +425,27 @@ async def bot_simulation_loop():
                                 "data": {"bot_id": bot["id"], "message": f'Failed to place live order for "{bot["name"]}": {e}'},
                             })
                             continue  # don't record a trade that never actually happened
+                        # A bot's live position gets its exits placed on
+                        # Binance as an OCO, same as a manual live order.
+                        # Bots are the case that matters most here: they run
+                        # unattended for days, so "the stop only works while
+                        # the backend is up" is a much bigger exposure for a
+                        # bot position than for one you placed by hand and
+                        # are watching.
+                        try:
+                            oco = await place_oco_exit(
+                                session, api_key, api_secret, testnet,
+                                bot["pair"], ta["type"], amount, ta["targetPrice"], ta["stopLoss"],
+                            )
+                            exchange_order_list_id = str(oco.get("orderListId")) if oco.get("orderListId") is not None else None
+                        except Exception as e:
+                            exchange_exit_error = str(e)
+                            log.warning("OCO exit failed for bot %s trade — app-monitored only: %s", bot["id"], e)
+                            await manager.send_to_user(bot["user_id"], {
+                                "type": "BOT_ERROR",
+                                "data": {"bot_id": bot["id"],
+                                         "message": f'"{bot["name"]}" opened a live position but its stop could not be placed on Binance ({e}) — it is monitored by the app only'},
+                            })
 
                     total = entry_price * amount
                     fee = total * 0.001
@@ -380,15 +470,28 @@ async def bot_simulation_loop():
                     # than only living transiently in the WS payload.
                     reason = ta.get("reason", "")
                     conn.execute(
-                        """INSERT INTO trades (id,user_id,bot_id,pair,side,price,amount,total,fee,pnl,stop_loss,take_profit,live,status,reason)
-                        VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,'FILLED',?)""",
+                        """INSERT INTO trades (id,user_id,bot_id,pair,side,price,amount,total,fee,pnl,stop_loss,take_profit,live,status,reason,
+                                               exchange_order_list_id,exchange_exit_error)
+                        VALUES (?,?,?,?,?,?,?,?,?,0,?,?,?,'FILLED',?,?,?)""",
                         (trade_id, bot["user_id"], bot["id"], bot["pair"], ta["type"],
-                         entry_price, amount, total, fee, ta["stopLoss"], ta["targetPrice"], int(is_live), reason),
+                         entry_price, amount, total, fee, ta["stopLoss"], ta["targetPrice"], int(is_live), reason,
+                         exchange_order_list_id, exchange_exit_error),
                     )
                     new_trades = bot["trades"] + 1
+                    # BUG FIX: this used to blindly set current_position to
+                    # whatever direction THIS entry was, and the close path
+                    # (below and in position_monitor_loop) blindly cleared it
+                    # to NULL on ANY close. That was correct back when a bot
+                    # could hold exactly one position — but with
+                    # max_open_positions now allowing several at once, a
+                    # second concurrent trade in the opposite direction would
+                    # silently overwrite what the first one showed, and
+                    # closing either one would blank the field even while the
+                    # other was still open. Recompute from what's ACTUALLY
+                    # open instead of tracking it by hand at every call site.
                     conn.execute(
                         "UPDATE bots SET trades=?, current_position=? WHERE id=?",
-                        (new_trades, "LONG" if ta["type"] == "BUY" else "SHORT", bot["id"]),
+                        (new_trades, _compute_current_position(conn, bot["id"]), bot["id"]),
                     )
                     await manager.send_to_user(bot["user_id"], {
                         "type": "NEW_TRADE",
@@ -418,7 +521,7 @@ async def position_monitor_loop():
     past either level.
     """
     from .crypto import decrypt
-    from .services.binance_client import extract_fill, place_market_order
+    from .services.binance_client import cancel_order_list, extract_fill, place_market_order
     from .services.market import live_tickers
 
     async with aiohttp.ClientSession() as session:
@@ -476,13 +579,37 @@ async def position_monitor_loop():
                     hit_time = False
                     if trade["bot_id"]:
                         bot_row = conn.execute(
-                            "SELECT max_hold_minutes FROM bots WHERE id=?", (trade["bot_id"],)
+                            "SELECT max_hold_minutes, timeframe FROM bots WHERE id=?", (trade["bot_id"],)
                         ).fetchone()
-                        if bot_row and bot_row["max_hold_minutes"]:
+                        if bot_row:
+                            hold_limit = bot_row["max_hold_minutes"]
+                            if not hold_limit:
+                                # No explicit limit set. Previously that meant
+                                # "hold forever" — combined with wide stops,
+                                # a single trade could occupy the bot's only
+                                # position slot for the entire week, which is
+                                # the main reason bots placed 0-2 trades in 5
+                                # days. Fall back to ~48 bars of the bot's own
+                                # timeframe: long enough that a setup gets a
+                                # fair run, short enough that a trade which
+                                # has clearly gone nowhere releases the slot.
+                                minutes_per_bar = TIMEFRAME_MINUTES.get(bot_row["timeframe"] or "15m", 15)
+                                hold_limit = minutes_per_bar * 48
                             elapsed_minutes = (time.time() - trade["created_at"]) / 60
-                            hit_time = elapsed_minutes >= bot_row["max_hold_minutes"]
+                            hit_time = elapsed_minutes >= hold_limit
 
                     if not (hit_sl or hit_tp or hit_time):
+                        continue
+
+                    # A LIVE trade whose exits are resting on Binance as an
+                    # OCO is the exchange's to close, not ours. Firing our
+                    # own market order here as well would race the exchange:
+                    # both could fill, leaving the account short (or long)
+                    # a position it never intended to open. reconcile_exchange_exits_loop
+                    # below is what notices the OCO filled and settles this
+                    # row. Max-hold is still ours to enforce, so that path
+                    # cancels the OCO first (see below).
+                    if trade["live"] and trade["exchange_order_list_id"] and not hit_time:
                         continue
 
                     exit_price = price
@@ -492,8 +619,17 @@ async def position_monitor_loop():
                             continue  # can't close a live position without credentials; leave it, will retry
                         api_key, api_secret, testnet = creds
                         try:
+                            # Same rule as the manual-close endpoint: a
+                            # resting OCO must be cancelled before we close
+                            # at market, or the leftover stop later fires
+                            # against a position that no longer exists.
+                            if trade["exchange_order_list_id"]:
+                                await cancel_order_list(
+                                    session, api_key, api_secret, testnet,
+                                    trade["pair"], int(trade["exchange_order_list_id"]),
+                                )
                             closing_side = "SELL" if side == "BUY" else "BUY"
-                            order = await place_market_order(session, api_key, api_secret, testnet, trade["pair"], closing_side, trade["amount"])
+                            order = await place_market_order(session, api_key, api_secret, testnet, trade["pair"], closing_side, trade["amount"], ref_price=price)
                             fill = extract_fill(order)
                             if fill:
                                 exit_price = fill["avg_price"]
@@ -537,7 +673,15 @@ async def position_monitor_loop():
                             bot = dict(bot)
                             new_wins = bot["wins"] + (1 if pnl >= 0 else 0)
                             new_losses = bot["losses"] + (0 if pnl >= 0 else 1)
-                            new_wr = (new_wins / bot["trades"] * 100) if bot["trades"] else 0
+                            # BUG FIX: win_rate divided by bot["trades"], the
+                            # count of trades OPENED — which includes any
+                            # still-open positions. With the new concurrent-
+                            # position support that gap widens, and win rate
+                            # read permanently low (e.g. 2 wins / 3 opened =
+                            # 66% when the real closed record was 2/2 = 100%).
+                            # Divide by decided trades only.
+                            decided = new_wins + new_losses
+                            new_wr = (new_wins / decided * 100) if decided else 0
                             capital_credit = (trade["total"] + pnl) if not trade["live"] else 0
 
                             # Missing feature: a consecutive-loss circuit breaker.
@@ -552,10 +696,17 @@ async def position_monitor_loop():
                             should_pause = limit > 0 and new_streak >= limit and bot["status"] == "RUNNING"
                             new_status = "PAUSED" if should_pause else bot["status"]
 
+                            # BUG FIX: this used to unconditionally null
+                            # current_position on ANY close — correct when a
+                            # bot could only ever hold one trade, wrong now
+                            # that max_open_positions lets it hold several:
+                            # closing one of two open positions would blank
+                            # the field even though the other is still open.
                             conn.execute(
                                 """UPDATE bots SET capital=capital+?, profit=profit+?, wins=?, losses=?,
-                                   win_rate=?, current_position=NULL, consecutive_losses=?, status=? WHERE id=?""",
-                                (capital_credit, pnl, new_wins, new_losses, new_wr, new_streak, new_status, bot["id"]),
+                                   win_rate=?, current_position=?, consecutive_losses=?, status=? WHERE id=?""",
+                                (capital_credit, pnl, new_wins, new_losses, new_wr,
+                                 _compute_current_position(conn, bot["id"]), new_streak, new_status, bot["id"]),
                             )
                             touched_bots.add(bot["id"])
                             if should_pause:
@@ -581,3 +732,160 @@ async def position_monitor_loop():
                 conn.close()
             except Exception as e:
                 log.error("Position monitor loop error: %s", e)
+
+
+async def reconcile_exchange_exits_loop():
+    """
+    Settles LIVE trades that BINANCE closed, not this app.
+
+    Once a trade's stop-loss/take-profit is a resting OCO on the exchange
+    (see routers/trades.py), the exchange can fill it at any time —
+    including while this process was restarting or offline, which is
+    exactly the scenario OCOs exist for. position_monitor_loop deliberately
+    does NOT market-close those trades, so without this loop the app would
+    keep showing a position as open forever after the exchange had already
+    closed it, and its P&L would never be realised.
+
+    Every cycle, for each open live trade with an orderListId: ask Binance
+    what happened to it. If a leg filled, read that leg's ACTUAL average
+    fill price (not the level it was supposed to trigger at — a stop-limit
+    in a fast market frequently fills some distance away) and settle the
+    row against it, crediting bot stats the same way position_monitor_loop
+    does for every other close.
+    """
+    from .crypto import decrypt
+    from .services.binance_client import get_order, get_order_list
+
+    async with aiohttp.ClientSession() as session:
+        while True:
+            await asyncio.sleep(20)
+            try:
+                conn = get_db()
+                rows = conn.execute(
+                    """SELECT * FROM trades
+                       WHERE status='FILLED' AND live=1 AND exchange_order_list_id IS NOT NULL"""
+                ).fetchall()
+                if not rows:
+                    conn.close()
+                    continue
+
+                touched_users = set()
+                creds_cache: dict = {}
+
+                def get_creds(user_id: str):
+                    if user_id in creds_cache:
+                        return creds_cache[user_id]
+                    row = conn.execute(
+                        "SELECT binance_api_key_enc, binance_api_secret_enc, binance_testnet FROM users WHERE id=?",
+                        (user_id,),
+                    ).fetchone()
+                    creds = None
+                    if row and row["binance_api_key_enc"] and row["binance_api_secret_enc"]:
+                        key = decrypt(row["binance_api_key_enc"])
+                        secret = decrypt(row["binance_api_secret_enc"])
+                        if key and secret:
+                            creds = (key, secret, bool(row["binance_testnet"]))
+                    creds_cache[user_id] = creds
+                    return creds
+
+                for row in rows:
+                    trade = dict(row)
+                    creds = get_creds(trade["user_id"])
+                    if not creds:
+                        continue
+                    api_key, api_secret, testnet = creds
+                    try:
+                        order_list = await get_order_list(
+                            session, api_key, api_secret, testnet, int(trade["exchange_order_list_id"])
+                        )
+                    except Exception as e:
+                        log.warning("OCO status check failed for trade %s: %s", trade["id"], e)
+                        continue
+
+                    if order_list.get("listOrderStatus") != "ALL_DONE":
+                        continue  # still resting
+
+                    # ALL_DONE covers both "a leg filled" and "the whole pair
+                    # was cancelled". Only a genuine FILLED leg closes the
+                    # position — a cancelled pair means the exits are simply
+                    # gone and the position is still open and now unprotected.
+                    exit_price = None
+                    for o in order_list.get("orders", []):
+                        try:
+                            detail = await get_order(
+                                session, api_key, api_secret, testnet, o["symbol"], int(o["orderId"])
+                            )
+                        except Exception:
+                            continue
+                        if detail.get("status") != "FILLED":
+                            continue
+                        executed = float(detail.get("executedQty", 0) or 0)
+                        quote = float(detail.get("cummulativeQuoteQty", 0) or 0)
+                        if executed > 0 and quote > 0:
+                            exit_price = quote / executed
+                            break
+
+                    if exit_price is None:
+                        # Cancelled rather than filled — clear the id so the
+                        # in-app monitor takes responsibility again, and tell
+                        # the user their exchange-side protection is gone.
+                        conn.execute(
+                            """UPDATE trades SET exchange_order_list_id=NULL,
+                               exchange_exit_error=? WHERE id=?""",
+                            ("Exit order is no longer on Binance (cancelled at the exchange) — "
+                             "this position is now monitored by the app only", trade["id"]),
+                        )
+                        await manager.send_to_user(trade["user_id"], {
+                            "type": "BOT_ERROR",
+                            "data": {"bot_id": trade["bot_id"],
+                                     "message": f"Binance exit order for {trade['pair']} was cancelled — position is now app-monitored only"},
+                        })
+                        continue
+
+                    pnl = ((exit_price - trade["price"]) if trade["side"] == "BUY"
+                           else (trade["price"] - exit_price)) * trade["amount"]
+                    pnl -= trade["fee"]
+                    conn.execute(
+                        """UPDATE trades SET status='CLOSED', pnl=?, closed_at=?,
+                           exchange_order_list_id=NULL WHERE id=?""",
+                        (pnl, int(time.time()), trade["id"]),
+                    )
+                    log.info("Trade %s settled from Binance OCO fill at %s", trade["id"], exit_price)
+
+                    # LIVE trades never touch the demo wallet or the bot's
+                    # demo capital pool — the money moved on the exchange.
+                    # Only the bot's performance record is updated, so its
+                    # win/loss stats cover live and demo trades alike.
+                    if trade["bot_id"]:
+                        bot = conn.execute("SELECT * FROM bots WHERE id=?", (trade["bot_id"],)).fetchone()
+                        if bot:
+                            bot = dict(bot)
+                            new_wins = bot["wins"] + (1 if pnl >= 0 else 0)
+                            new_losses = bot["losses"] + (0 if pnl >= 0 else 1)
+                            decided = new_wins + new_losses
+                            new_wr = (new_wins / decided * 100) if decided else 0
+                            new_streak = 0 if pnl >= 0 else bot["consecutive_losses"] + 1
+                            limit = bot["auto_pause_after_losses"] or 0
+                            should_pause = limit > 0 and new_streak >= limit and bot["status"] == "RUNNING"
+                            conn.execute(
+                                """UPDATE bots SET profit=profit+?, wins=?, losses=?, win_rate=?,
+                                   current_position=?, consecutive_losses=?, status=? WHERE id=?""",
+                                (pnl, new_wins, new_losses, new_wr,
+                                 _compute_current_position(conn, bot["id"]), new_streak,
+                                 "PAUSED" if should_pause else bot["status"], bot["id"]),
+                            )
+
+                    touched_users.add(trade["user_id"])
+                    await manager.send_to_user(trade["user_id"], {
+                        "type": "NEW_TRADE",
+                        "data": {**trade, "status": "CLOSED", "pnl": pnl,
+                                 "timestamp": int(time.time() * 1000)},
+                    })
+
+                conn.commit()
+                for uid in touched_users:
+                    updated = conn.execute("SELECT * FROM bots WHERE user_id=?", (uid,)).fetchall()
+                    await manager.send_to_user(uid, {"type": "BOTS_UPDATE", "data": [serialize_bot(b) for b in updated]})
+                conn.close()
+            except Exception as e:
+                log.error("Exchange reconcile loop error: %s", e)
