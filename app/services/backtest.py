@@ -14,9 +14,10 @@ these presets it maps to, and doubles as the description shown in the UI.
 import math
 from typing import List, TypedDict
 
+from . import smc
 from .indicators import calc_atr, calc_bb, calc_ema, calc_macd, calc_rsi
 
-PRESETS = ("RSI Scalper", "EMA Cross", "MACD Divergence", "Bollinger Squeeze", "Grid Trading")
+PRESETS = ("RSI Scalper", "EMA Cross", "MACD Divergence", "Bollinger Squeeze", "Grid Trading", "Smart Money Concepts")
 
 # Tunable knobs per preset, seeded onto a new Strategy row at creation time
 # and read back here on every run. Before this, every "RSI Scalper"
@@ -36,6 +37,11 @@ DEFAULT_PARAMS = {
     "MACD Divergence": {"stopPct": 3},
     "Bollinger Squeeze": {"bbPeriod": 20, "bbStdDev": 2, "stopPct": 3},
     "Grid Trading": {"gridPct": 1.5, "stopPct": 3},
+    # A wider default stop than the others — a swept swing low is a real
+    # market structure level, not an arbitrary %, so it needs enough room
+    # for normal noise around that level rather than being clipped
+    # immediately by a tight stop.
+    "Smart Money Concepts": {"stopPct": 2.5, "riskReward": 2.0},
 }
 
 
@@ -239,12 +245,67 @@ def _run_grid_trading(candles: List[dict], params: dict) -> List[BacktestTrade]:
     return trades
 
 
+def _run_smart_money(candles: List[dict], params: dict) -> List[BacktestTrade]:
+    """Smart Money Concepts: long-only liquidity-sweep reversal, built on
+    the SAME detectors the chart draws (app/services/smc.py) — not a
+    separate reimplementation, so a backtest here reflects exactly what
+    the sweep/structure overlays on the chart would have shown at the
+    time.
+
+    Entry: a bullish liquidity sweep (wick below the most recently
+    confirmed swing low, closes back above it) while market structure
+    isn't in a confirmed downtrend.
+
+    This intentionally does NOT also check order-block/FVG retests the
+    way the live evaluator below does — recomputing those (each of which
+    scans forward from every candidate for a mitigation check) at every
+    single historical bar would make a multi-hundred-candle backtest scan
+    quadratically slower for a confluence signal that fires rarely enough
+    it wouldn't meaningfully change the backtest's numbers. Live
+    evaluation only ever runs the full computation once per tick, so it
+    gets the richer version — see evaluate_preset_live.
+
+    Every window is capped to the most recent `WINDOW` candles before
+    each bar so structure/sweep detection stays cheap and, more
+    importantly, causal: `smc.find_market_structure`/`find_liquidity_sweeps`
+    only ever see candles up to and including the current bar, never the
+    future.
+    """
+    WINDOW = 120
+    lookback = 3
+    stop_pct = params.get("stopPct", DEFAULT_PARAMS["Smart Money Concepts"]["stopPct"]) / 100
+    target_pct = stop_pct * params.get("riskReward", DEFAULT_PARAMS["Smart Money Concepts"]["riskReward"])
+    trades: List[BacktestTrade] = []
+    position = None
+
+    for i in range(lookback * 2 + 5, len(candles)):
+        window = candles[max(0, i - WINDOW):i + 1]
+        c = candles[i]
+        if position is None:
+            structure = smc.find_market_structure(window, lookback)
+            if structure["trend"] == "bearish":
+                continue
+            sweeps = smc.find_liquidity_sweeps(window, structure["swings"])
+            bar_time = int(c["time"] / 1000)
+            swept_now = any(s["kind"] == "bullish" and s["time"] == bar_time for s in sweeps)
+            if swept_now:
+                position = (c["close"], c["time"])
+        else:
+            entry_price, entry_time = position
+            change = (c["close"] - entry_price) / entry_price
+            if change >= target_pct or change <= -stop_pct:
+                trades.append(_close_position(c, entry_price, entry_time, "BUY"))
+                position = None
+    return trades
+
+
 RUNNERS = {
     "RSI Scalper": _run_rsi_scalper,
     "EMA Cross": _run_ema_cross,
     "MACD Divergence": _run_macd_divergence,
     "Bollinger Squeeze": _run_bollinger_squeeze,
     "Grid Trading": _run_grid_trading,
+    "Smart Money Concepts": _run_smart_money,
 }
 
 
@@ -564,6 +625,60 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
             overshoot = actual_pct - grid_pct  # how far past the configured grid step
             confidence = round(_clamp(60 + overshoot * 8, 60, 95))
         reason = f"Price {grid_pct}% below 20-period SMA on a bullish candle"
+    elif strategy_name == "Smart Money Concepts":
+        # Live evaluation runs the FULL shared detector set (structure +
+        # sweeps + order blocks + fair value gaps + POI retest) once per
+        # tick on whatever history was fetched — same functions the chart
+        # uses (app/services/smc.py), just called here instead of over
+        # the API. See _run_smart_money above for why the backtest runner
+        # only uses the cheaper sweep+structure subset of this.
+        structure = smc.find_market_structure(candles)
+        trend = structure["trend"]
+        c = candles[-1]
+        entered = False
+        confluence = ""
+
+        if trend != "bearish":
+            sweeps = smc.find_liquidity_sweeps(candles, structure["swings"])
+            last_bar_time = int(c["time"] / 1000)
+            swept = next((s for s in sweeps if s["kind"] == "bullish" and s["time"] == last_bar_time), None)
+            if swept:
+                entered = True
+                confluence = f"liquidity sweep of swing low {swept['level']:.4f}"
+            else:
+                order_blocks = smc.find_order_blocks(candles)
+                fvgs = smc.find_fair_value_gaps(candles)
+                # NOTE: deliberately NOT smc.find_points_of_interest here —
+                # that helper is built for the chart's "nearest watch
+                # zone" display and explicitly EXCLUDES any zone the
+                # current price is sitting inside of (it only returns the
+                # closest zone strictly above or strictly below price).
+                # A retest is by definition price sitting inside the
+                # zone, so this checks the raw unmitigated/unfilled lists
+                # directly instead.
+                poi = next(
+                    (z for z in order_blocks
+                     if not z["mitigated"] and z["kind"] == "bullish" and c["low"] <= z["top"] and c["close"] > z["bottom"]),
+                    None,
+                )
+                source = "OB"
+                if poi is None:
+                    poi = next(
+                        (z for z in fvgs
+                         if not z["filled"] and z["kind"] == "bullish" and c["low"] <= z["top"] and c["close"] > z["bottom"]),
+                        None,
+                    )
+                    source = "FVG"
+                if poi:
+                    entered = True
+                    confluence = f"retest of a bullish {source} zone ({poi['bottom']:.4f}-{poi['top']:.4f})"
+
+        if entered:
+            confidence = round(_clamp(70 + (10 if trend == "bullish" else 0), 60, 95))
+        reason = (
+            f"{confluence[0].upper()}{confluence[1:]} (structure: {trend})" if entered
+            else f"No confirmed sweep or POI retest yet (structure: {trend})"
+        )
 
     if not entered:
         return {
