@@ -38,10 +38,12 @@ class OrderBlock(TypedDict):
     time: int  # seconds — origin candle's bar time
     mitigated: bool
     strength: float
+    formed_at: int  # seconds — the impulse candle that confirmed the block
 
 
 def _order_blocks_pass(candles: List[dict], impulse_mult: float, origin_lookback: int) -> List[OrderBlock]:
     blocks: List[OrderBlock] = []
+    seen_origin: Dict[int, OrderBlock] = {}
     if not candles:
         return blocks
     last_price = candles[-1]["close"]
@@ -82,12 +84,27 @@ def _order_blocks_pass(candles: List[dict], impulse_mult: float, origin_lookback
                 mitigated = True
                 break
 
-        blocks.append({
+        origin_time = int(origin["time"] / 1000)
+        prev = seen_origin.get(origin_time)
+        if prev is not None:
+            # Several impulse candles in a row all point back at the SAME
+            # origin candle. That used to emit one identical rectangle per
+            # impulse — stacked copies eating the max_blocks slots and
+            # drawn on top of each other. Keep the earliest one (its
+            # mitigation scan starts at the true formation, so its
+            # `mitigated` flag is the honest one) and just remember the
+            # strongest impulse seen.
+            prev["strength"] = max(prev["strength"], body / avg_body)
+            continue
+        block: OrderBlock = {
             "top": top, "bottom": bottom,
             "kind": "bullish" if bullish_impulse else "bearish",
-            "time": int(origin["time"] / 1000),
+            "time": origin_time,
             "mitigated": mitigated, "strength": body / avg_body,
-        })
+            "formed_at": int(impulse["time"] / 1000),
+        }
+        seen_origin[origin_time] = block
+        blocks.append(block)
 
     def sort_key(b: OrderBlock):
         dist = min(abs(b["top"] - last_price), abs(b["bottom"] - last_price))
@@ -113,6 +130,7 @@ class SDZone(TypedDict):
     time: int
     touches: int
     fresh: bool
+    formed_at: int  # seconds — the departure candle that confirmed the zone
 
 
 def _supply_demand_pass(
@@ -168,6 +186,7 @@ def _supply_demand_pass(
             "time": int(base[-1]["time"] / 1000),
             "top": top, "bottom": bottom, "kind": kind,
             "touches": touches, "fresh": touches == 0,
+            "formed_at": int(departure["time"] / 1000),
         })
     return zones
 
@@ -382,3 +401,350 @@ def find_points_of_interest(
     if above:
         result.append(above[0])
     return result
+
+
+# ── Retests ─────────────────────────────────────────────────────────────────
+class Retest(TypedDict):
+    time: int        # seconds — the bar where price came back into the zone
+    kind: str        # "bullish" (into demand/support) | "bearish" (into supply/resistance)
+    source: str      # "OB" | "FVG" | "S/D"
+    top: float
+    bottom: float
+    zone_time: int   # seconds — the zone's own anchor time (for drawing)
+    confirmed: bool  # closed back OUT of the zone on the zone's side = a rejection, not just a touch
+    active: bool     # the newest candle is the one doing the retest right now
+
+
+def _touches_zone(c: dict, top: float, bottom: float, kind: str) -> bool:
+    """Same test the bot has always used for 'price is retesting a bullish
+    zone': the candle reached down into it (low <= top) without closing
+    through the far side (close > bottom). Mirrored for bearish."""
+    if kind == "bullish":
+        return c["low"] <= top and c["close"] > bottom
+    return c["high"] >= bottom and c["close"] < top
+
+
+def find_retests(
+    candles: List[dict],
+    order_blocks: List[OrderBlock],
+    fvgs: List[FVG],
+    sd_zones: Optional[List[SDZone]] = None,
+    max_age: int = 60,
+    max_retests: int = 8,
+) -> List[Retest]:
+    """Every time price came back into a still-live zone after it formed.
+
+    A "retest" is the FIRST bar of each return visit into an unmitigated
+    order block, unfilled fair value gap or (unbroken) supply/demand zone —
+    consecutive bars sitting inside the same zone are one visit, not many.
+    Only the most recent visit per zone is kept, and only visits within the
+    last `max_age` bars, so the chart marks what's relevant now instead of
+    every historical touch.
+    """
+    n = len(candles)
+    if n < 5:
+        return []
+    idx_by_time = {int(c["time"] / 1000): i for i, c in enumerate(candles)}
+    last_idx = n - 1
+
+    zones: List[Dict] = []
+    for b in order_blocks:
+        if not b["mitigated"]:
+            zones.append({"top": b["top"], "bottom": b["bottom"], "kind": b["kind"], "source": "OB",
+                          "zone_time": b["time"], "formed_at": b.get("formed_at", b["time"])})
+    for g in fvgs:
+        if not g["filled"]:
+            zones.append({"top": g["top"], "bottom": g["bottom"], "kind": g["kind"], "source": "FVG",
+                          "zone_time": g["time"], "formed_at": g["time"]})
+    for z in (sd_zones or []):
+        zones.append({"top": z["top"], "bottom": z["bottom"],
+                      "kind": "bullish" if z["kind"] == "demand" else "bearish", "source": "S/D",
+                      "zone_time": z["time"], "formed_at": z.get("formed_at", z["time"])})
+
+    retests: List[Retest] = []
+    for z in zones:
+        start = idx_by_time.get(z["formed_at"])
+        if start is None:
+            # Formed before the window we were handed (or on a bar we
+            # can't locate) — scan the whole window rather than drop it.
+            start = -1
+        # Walk forward once, remembering where the LATEST visit into the
+        # zone began. A close through the far side kills the zone, and with
+        # it any retest we'd have reported for it.
+        visit_start: Optional[int] = None
+        prev_inside = False
+        for j in range(start + 1, n):
+            c = candles[j]
+            if z["kind"] == "bullish" and c["close"] <= z["bottom"]:
+                visit_start = None
+                break
+            if z["kind"] == "bearish" and c["close"] >= z["top"]:
+                visit_start = None
+                break
+            inside = _touches_zone(c, z["top"], z["bottom"], z["kind"])
+            if inside and not prev_inside:
+                visit_start = j
+            prev_inside = inside
+        if visit_start is None or last_idx - visit_start > max_age:
+            continue
+        # The visit's first bar, and whether the LATEST bar is still in it.
+        c = candles[visit_start]
+        if z["kind"] == "bullish":
+            confirmed = c["close"] > z["top"]
+        else:
+            confirmed = c["close"] < z["bottom"]
+        retests.append({
+            "time": int(c["time"] / 1000), "kind": z["kind"], "source": z["source"],
+            "top": z["top"], "bottom": z["bottom"], "zone_time": z["zone_time"],
+            "confirmed": confirmed,
+            "active": _touches_zone(candles[last_idx], z["top"], z["bottom"], z["kind"]),
+        })
+
+    retests.sort(key=lambda r: r["time"])
+    return retests[-max_retests:]
+
+
+# ── One-call snapshot ──────────────────────────────────────────────────────
+# Candles the chart AND every SMC bot look at. One number in one place, so a
+# zone drawn on the chart is a zone the bot saw — see analyze() below.
+SMC_WINDOW = 300
+
+
+def analyze(candles: List[dict]) -> Dict:
+    """Everything the chart draws and everything the bot decides on, from
+    ONE pass over ONE candle list. The /market/smc endpoint serialises this
+    for the chart; evaluate_entry() below reads it to make the trade
+    decision. There is no second implementation to drift."""
+    order_blocks = find_order_blocks(candles)
+    fvgs = find_fair_value_gaps(candles)
+    sd_zones = find_supply_demand_zones(candles)
+    structure = find_market_structure(candles)
+    sweeps = find_liquidity_sweeps(candles, structure["swings"])
+    poi = find_points_of_interest(candles, order_blocks, fvgs, sd_zones)
+    retests = find_retests(candles, order_blocks, fvgs, sd_zones)
+    return {
+        "order_blocks": order_blocks, "fvgs": fvgs, "sd_zones": sd_zones,
+        "structure": structure, "sweeps": sweeps, "poi": poi, "retests": retests,
+    }
+
+
+# ── The decision ───────────────────────────────────────────────────────────
+def _fmt(p: float) -> str:
+    if p >= 1000:
+        return f"{p:,.2f}"
+    if p >= 1:
+        return f"{p:.4f}"
+    return f"{p:.6f}"
+
+
+def _step(step: str, status: str, message: str, sig: Optional[str] = None) -> Dict:
+    """One line of the decision trace.
+
+    status: "pass"  the condition is met
+            "wait"  not met (yet) — normal, just no trade
+            "block" a hard filter that vetoes entries outright
+            "info"  context, not a condition
+    sig:    a short, price-free fingerprint of the line, so the bot log can
+            tell "same situation as last cycle" from "something changed"
+            without spamming an identical row every 15 seconds.
+    """
+    return {"step": step, "status": status, "message": message, "sig": sig if sig is not None else f"{status}"}
+
+
+def evaluate_entry(candles: List[dict], snapshot: Optional[Dict] = None) -> Dict:
+    """The Smart Money Concepts entry decision, with its working shown.
+
+    Long-only (spot can't be shorted, and every other preset here is
+    long-only too). Bearish structure/sweeps/zones are still detected and
+    reported in the trace — they just never open a trade.
+
+    ENTER when ALL of:
+      1. structure is not bearish (bullish = confidence bonus), AND
+      2. on the newest bar, either
+           a. price swept a swing low and closed back above it, OR
+           b. price is retesting a live bullish zone (order block, fair
+              value gap, or a first-touch demand zone).
+
+    Returns {"type": "BUY"|"HOLD", "confidence", "reason", "trigger",
+    "zone", "invalidation", "trend", "steps"}.
+    """
+    if len(candles) < 30:
+        return {
+            "type": "HOLD", "confidence": 0, "trigger": None, "zone": None, "invalidation": None,
+            "trend": "ranging",
+            "reason": f"Not enough candles yet ({len(candles)}/30)",
+            "steps": [_step("DATA", "wait", f"Only {len(candles)} candles loaded — need at least 30", "few")],
+        }
+
+    snap = snapshot or analyze(candles)
+    c = candles[-1]
+    price = c["close"]
+    last_t = int(c["time"] / 1000)
+    idx_by_time = {int(x["time"] / 1000): i for i, x in enumerate(candles)}
+    last_idx = len(candles) - 1
+    steps: List[Dict] = []
+
+    steps.append(_step("DATA", "info", f"{len(candles)} candles read, last close {_fmt(price)}", "data"))
+
+    # 1 ── structure ───────────────────────────────────────────────────────
+    structure = snap["structure"]
+    trend = structure["trend"]
+    swings = structure["swings"]
+    last_high = next((s for s in reversed(swings) if s["kind"] == "high" and s["label"]), None)
+    last_low = next((s for s in reversed(swings) if s["kind"] == "low" and s["label"]), None)
+    seq = " / ".join(
+        f"{s['label']} {_fmt(s['price'])}" for s in (last_high, last_low) if s
+    ) or "not enough swings yet"
+    if trend == "bearish":
+        steps.append(_step("STRUCTURE", "block",
+                           f"Trend BEARISH ({seq}) — long-only, so entries are blocked", "bearish"))
+    elif trend == "bullish":
+        steps.append(_step("STRUCTURE", "pass", f"Trend BULLISH ({seq})", "bullish"))
+    else:
+        steps.append(_step("STRUCTURE", "info", f"Trend RANGING ({seq}) — allowed, no bullish bonus", "ranging"))
+
+    # 2 ── liquidity sweeps ────────────────────────────────────────────────
+    sweeps = snap["sweeps"]
+    swept_now = next((s for s in sweeps if s["kind"] == "bullish" and s["time"] == last_t), None)
+    bear_now = next((s for s in sweeps if s["kind"] == "bearish" and s["time"] == last_t), None)
+    if swept_now:
+        steps.append(_step("SWEEP", "pass",
+                           f"Bullish sweep — wick to {_fmt(swept_now['wick'])} took out swing low "
+                           f"{_fmt(swept_now['level'])}, closed back above it", "sweep-now"))
+    else:
+        prev = next((s for s in reversed(sweeps) if s["kind"] == "bullish"), None)
+        if prev:
+            ago = last_idx - idx_by_time.get(prev["time"], last_idx)
+            steps.append(_step("SWEEP", "wait",
+                               f"No bullish sweep on this bar (last one {ago} bars ago at {_fmt(prev['level'])})",
+                               "sweep-none"))
+        else:
+            steps.append(_step("SWEEP", "wait", "No bullish liquidity sweep in the recent swings", "sweep-none"))
+    if bear_now:
+        steps.append(_step("SWEEP", "info",
+                           f"Bearish sweep of swing high {_fmt(bear_now['level'])} on this bar — "
+                           f"noted, but long-only so no short is taken", "sweep-bear"))
+
+    # 3 ── zones on the map ────────────────────────────────────────────────
+    obs = [b for b in snap["order_blocks"] if not b["mitigated"]]
+    gaps = [g for g in snap["fvgs"] if not g["filled"]]
+    sd = snap["sd_zones"]
+    poi = snap["poi"]
+    sup = next((p for p in poi if p["top"] <= price), None)
+    res = next((p for p in poi if p["bottom"] >= price), None)
+    parts = [f"{len(obs)} order block{'s' if len(obs) != 1 else ''}",
+             f"{len(gaps)} open FVG{'s' if len(gaps) != 1 else ''}",
+             f"{len(sd)} S/D zone{'s' if len(sd) != 1 else ''}"]
+    poi_txt = ""
+    if sup:
+        poi_txt += f" | POI below: {sup['source']} {_fmt(sup['bottom'])}–{_fmt(sup['top'])} ({(sup['top'] - price) / price * 100:+.2f}%)"
+    if res:
+        poi_txt += f" | POI above: {res['source']} {_fmt(res['bottom'])}–{_fmt(res['top'])} ({(res['bottom'] - price) / price * 100:+.2f}%)"
+    steps.append(_step("ZONES", "info", "Live zones: " + ", ".join(parts) + poi_txt,
+                       f"zones-{len(obs)}-{len(gaps)}-{len(sd)}"))
+
+    # 4 ── retest of a live bullish zone (newest bar) ──────────────────────
+    # A zone must already exist BEFORE the newest bar to be retested by it.
+    # Without this the bar that CREATES a zone counted as its own retest —
+    # an order block's impulse candle opens at the block, and a fair value
+    # gap's top IS its third candle's low — so the bot "bought the retest"
+    # on the very candle the zone formed, i.e. chased the impulse instead of
+    # waiting for price to come back.
+    zone = None
+    for b in obs:
+        if b.get("formed_at", b["time"]) >= last_t:
+            continue
+        if b["kind"] == "bullish" and _touches_zone(c, b["top"], b["bottom"], "bullish"):
+            zone = {"source": "OB", "kind": "bullish", "top": b["top"], "bottom": b["bottom"], "time": b["time"]}
+            break
+    if zone is None:
+        for g in gaps:
+            if g["time"] >= last_t:
+                continue
+            if g["kind"] == "bullish" and _touches_zone(c, g["top"], g["bottom"], "bullish"):
+                zone = {"source": "FVG", "kind": "bullish", "top": g["top"], "bottom": g["bottom"], "time": g["time"]}
+                break
+    if zone is None:
+        for z in sd:
+            # A demand zone only counts on its first real return — one
+            # that's been hit over and over is spent liquidity.
+            if z.get("formed_at", z["time"]) >= last_t:
+                continue
+            if z["kind"] == "demand" and z["touches"] <= 1 and _touches_zone(c, z["top"], z["bottom"], "bullish"):
+                zone = {"source": "S/D", "kind": "bullish", "top": z["top"], "bottom": z["bottom"], "time": z["time"]}
+                break
+    if zone:
+        steps.append(_step("RETEST", "pass",
+                           f"Retest of bullish {zone['source']} zone {_fmt(zone['bottom'])}–{_fmt(zone['top'])} "
+                           f"(low {_fmt(c['low'])}, close {_fmt(price)})", f"retest-{zone['source']}"))
+    else:
+        in_bear = next(
+            (b for b in obs if b["kind"] == "bearish" and _touches_zone(c, b["top"], b["bottom"], "bearish")), None)
+        if in_bear:
+            steps.append(_step("RETEST", "info",
+                               f"Price is inside a bearish OB {_fmt(in_bear['bottom'])}–{_fmt(in_bear['top'])} "
+                               f"— resistance, no long", "retest-bear"))
+        elif sup:
+            steps.append(_step("RETEST", "wait",
+                               f"Not in a bullish zone — nearest support is {sup['source']} "
+                               f"{_fmt(sup['bottom'])}–{_fmt(sup['top'])}, {(price - sup['top']) / price * 100:.2f}% below",
+                               "retest-none"))
+        else:
+            steps.append(_step("RETEST", "wait", "Not in a bullish zone — no live support zone below price", "retest-none"))
+
+    # 5 ── decision ────────────────────────────────────────────────────────
+    entered = trend != "bearish" and (swept_now is not None or zone is not None)
+    confidence = 0
+    trigger = None
+    invalidation = None
+    confluence = ""
+    if entered:
+        if swept_now and zone:
+            trigger = "sweep+retest"
+            confluence = (f"liquidity sweep of swing low {swept_now['level']:.4f} "
+                          f"into a bullish {zone['source']} zone ({zone['bottom']:.4f}-{zone['top']:.4f})")
+            invalidation = min(swept_now["wick"], zone["bottom"])
+        elif swept_now:
+            trigger = "sweep"
+            confluence = f"liquidity sweep of swing low {swept_now['level']:.4f}"
+            invalidation = swept_now["wick"]
+        else:
+            trigger = f"retest-{zone['source']}"
+            confluence = f"retest of a bullish {zone['source']} zone ({zone['bottom']:.4f}-{zone['top']:.4f})"
+            invalidation = zone["bottom"]
+        confidence = 70
+        if trend == "bullish":
+            confidence += 10
+        if swept_now and zone:
+            confidence += 5
+        if zone:
+            # A second live bullish zone stacked on the same price = more
+            # orders resting there than a lone zone.
+            stacked = [
+                o for o in obs
+                if o["kind"] == "bullish" and not (o["top"] == zone["top"] and o["bottom"] == zone["bottom"])
+                and o["bottom"] <= zone["top"] and o["top"] >= zone["bottom"]
+            ] + [
+                g for g in gaps
+                if g["kind"] == "bullish" and not (g["top"] == zone["top"] and g["bottom"] == zone["bottom"])
+                and g["bottom"] <= zone["top"] and g["top"] >= zone["bottom"]
+            ]
+            if stacked:
+                confidence += 5
+        confidence = max(60, min(95, confidence))
+        reason = f"{confluence[0].upper()}{confluence[1:]} (structure: {trend})"
+        steps.append(_step("DECISION", "pass",
+                           f"BUY — {confluence}; structure {trend}; confidence {confidence}%; "
+                           f"invalidation below {_fmt(invalidation)}", f"buy-{trigger}"))
+    else:
+        if trend == "bearish":
+            why = "structure is bearish (long-only)"
+        else:
+            why = "no bullish sweep and no retest of a live bullish zone on this bar"
+        reason = f"No confirmed sweep or POI retest yet (structure: {trend})"
+        steps.append(_step("DECISION", "wait", f"HOLD — {why}", f"hold-{trend}"))
+
+    return {
+        "type": "BUY" if entered else "HOLD", "confidence": confidence, "reason": reason,
+        "trigger": trigger, "zone": zone, "invalidation": invalidation, "trend": trend, "steps": steps,
+    }

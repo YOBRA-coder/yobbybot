@@ -64,5 +64,5 @@ async def health():
         # Python process). If it shows this tag and a symptom persists,
         # it's a real remaining bug, not a stale deploy — report it as
         # that.
-        "build": "2026-graduated-confidence-oco-concurrent-positions",
+        "build": "2026-smc-overlays-retests-botlogs",
     }

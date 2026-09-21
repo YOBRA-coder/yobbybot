@@ -246,32 +246,25 @@ def _run_grid_trading(candles: List[dict], params: dict) -> List[BacktestTrade]:
 
 
 def _run_smart_money(candles: List[dict], params: dict) -> List[BacktestTrade]:
-    """Smart Money Concepts: long-only liquidity-sweep reversal, built on
-    the SAME detectors the chart draws (app/services/smc.py) — not a
-    separate reimplementation, so a backtest here reflects exactly what
-    the sweep/structure overlays on the chart would have shown at the
-    time.
+    """Smart Money Concepts: long-only, trading the EXACT decision the live
+    bot makes — `smc.evaluate_entry` — bar by bar.
 
-    Entry: a bullish liquidity sweep (wick below the most recently
-    confirmed swing low, closes back above it) while market structure
-    isn't in a confirmed downtrend.
+    That decision reads the same detectors the chart draws (structure with
+    HH/HL/LH/LL, liquidity sweeps, order blocks, fair value gaps, supply/
+    demand zones, retests), so a backtest here is a replay of what the
+    overlays on the chart would have shown at the time, and what the bot
+    would have done about it. (Earlier versions only used sweep + structure
+    here and left order-block / FVG retests to the live evaluator, which
+    meant the backtest and the live bot were two different strategies with
+    one name.)
 
-    This intentionally does NOT also check order-block/FVG retests the
-    way the live evaluator below does — recomputing those (each of which
-    scans forward from every candidate for a mitigation check) at every
-    single historical bar would make a multi-hundred-candle backtest scan
-    quadratically slower for a confluence signal that fires rarely enough
-    it wouldn't meaningfully change the backtest's numbers. Live
-    evaluation only ever runs the full computation once per tick, so it
-    gets the richer version — see evaluate_preset_live.
+    Causal by construction: each bar is evaluated on a window that ENDS at
+    that bar, never on candles after it. The window is `smc.SMC_WINDOW`
+    (300) candles — the same amount the live bot and the chart's /market/smc
+    endpoint use — so zones age and get ranked the same way in all three.
 
-    Every window is capped to the most recent `WINDOW` candles before
-    each bar so structure/sweep detection stays cheap and, more
-    importantly, causal: `smc.find_market_structure`/`find_liquidity_sweeps`
-    only ever see candles up to and including the current bar, never the
-    future.
+    Exit is a fixed stop / target on the close, as for the other presets.
     """
-    WINDOW = 120
     lookback = 3
     stop_pct = params.get("stopPct", DEFAULT_PARAMS["Smart Money Concepts"]["stopPct"]) / 100
     target_pct = stop_pct * params.get("riskReward", DEFAULT_PARAMS["Smart Money Concepts"]["riskReward"])
@@ -279,16 +272,10 @@ def _run_smart_money(candles: List[dict], params: dict) -> List[BacktestTrade]:
     position = None
 
     for i in range(lookback * 2 + 5, len(candles)):
-        window = candles[max(0, i - WINDOW):i + 1]
         c = candles[i]
         if position is None:
-            structure = smc.find_market_structure(window, lookback)
-            if structure["trend"] == "bearish":
-                continue
-            sweeps = smc.find_liquidity_sweeps(window, structure["swings"])
-            bar_time = int(c["time"] / 1000)
-            swept_now = any(s["kind"] == "bullish" and s["time"] == bar_time for s in sweeps)
-            if swept_now:
+            window = candles[max(0, i - smc.SMC_WINDOW + 1):i + 1]
+            if smc.evaluate_entry(window)["type"] == "BUY":
                 position = (c["close"], c["time"])
         else:
             entry_price, entry_time = position
@@ -458,8 +445,11 @@ def evaluate_confluence_live(strategy_names: List[str], candles: List[dict], min
     required = min(required, len(strategy_names))
 
     agreed, held = [], []
+    smc_steps = None  # if Smart Money Concepts is in the panel, keep its trace for the bot log
     for name in strategy_names:
         result = evaluate_preset_live(name, candles)
+        if result and result.get("steps"):
+            smc_steps = result["steps"]
         if result and result["type"] == "BUY":
             agreed.append((name, result))
         else:
@@ -473,6 +463,7 @@ def evaluate_confluence_live(strategy_names: List[str], candles: List[dict], min
             "stopLoss": candles[-1]["close"] if candles else 0,
             "reason": f"Confluence ({names_str}): {len(agreed)}/{required} required agree — " +
                       (f"waiting on {', '.join(held)}" if held else "no agreement yet"),
+            **({"steps": smc_steps} if smc_steps else {}),
         }
 
     # Combine the agreeing strategies' own targets/stops rather than
@@ -492,6 +483,7 @@ def evaluate_confluence_live(strategy_names: List[str], candles: List[dict], min
         "type": "BUY", "strength": len(agreed), "confidence": confidence,
         "targetPrice": avg_target, "stopLoss": tightest_stop,
         "reason": f"Confluence: {len(agreed)}/{len(strategy_names)} strategies agree ({agreed_names})",
+        **({"steps": smc_steps} if smc_steps else {}),
     }
 
 
@@ -551,6 +543,7 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
     # signals that clear it — so trade frequency tracks actual market
     # conviction instead of being a coin flip against a fixed number.
     confidence = 0
+    smc_steps = None  # only the SMC preset produces a step-by-step trace
 
     if strategy_name == "RSI Scalper":
         rsi = calc_rsi(closes)
@@ -626,66 +619,28 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
             confidence = round(_clamp(60 + overshoot * 8, 60, 95))
         reason = f"Price {grid_pct}% below 20-period SMA on a bullish candle"
     elif strategy_name == "Smart Money Concepts":
-        # Live evaluation runs the FULL shared detector set (structure +
-        # sweeps + order blocks + fair value gaps + POI retest) once per
-        # tick on whatever history was fetched — same functions the chart
-        # uses (app/services/smc.py), just called here instead of over
-        # the API. See _run_smart_money above for why the backtest runner
-        # only uses the cheaper sweep+structure subset of this.
-        structure = smc.find_market_structure(candles)
-        trend = structure["trend"]
-        c = candles[-1]
-        entered = False
-        confluence = ""
-
-        if trend != "bearish":
-            sweeps = smc.find_liquidity_sweeps(candles, structure["swings"])
-            last_bar_time = int(c["time"] / 1000)
-            swept = next((s for s in sweeps if s["kind"] == "bullish" and s["time"] == last_bar_time), None)
-            if swept:
-                entered = True
-                confluence = f"liquidity sweep of swing low {swept['level']:.4f}"
-            else:
-                order_blocks = smc.find_order_blocks(candles)
-                fvgs = smc.find_fair_value_gaps(candles)
-                # NOTE: deliberately NOT smc.find_points_of_interest here —
-                # that helper is built for the chart's "nearest watch
-                # zone" display and explicitly EXCLUDES any zone the
-                # current price is sitting inside of (it only returns the
-                # closest zone strictly above or strictly below price).
-                # A retest is by definition price sitting inside the
-                # zone, so this checks the raw unmitigated/unfilled lists
-                # directly instead.
-                poi = next(
-                    (z for z in order_blocks
-                     if not z["mitigated"] and z["kind"] == "bullish" and c["low"] <= z["top"] and c["close"] > z["bottom"]),
-                    None,
-                )
-                source = "OB"
-                if poi is None:
-                    poi = next(
-                        (z for z in fvgs
-                         if not z["filled"] and z["kind"] == "bullish" and c["low"] <= z["top"] and c["close"] > z["bottom"]),
-                        None,
-                    )
-                    source = "FVG"
-                if poi:
-                    entered = True
-                    confluence = f"retest of a bullish {source} zone ({poi['bottom']:.4f}-{poi['top']:.4f})"
-
-        if entered:
-            confidence = round(_clamp(70 + (10 if trend == "bullish" else 0), 60, 95))
-        reason = (
-            f"{confluence[0].upper()}{confluence[1:]} (structure: {trend})" if entered
-            else f"No confirmed sweep or POI retest yet (structure: {trend})"
-        )
+        # The whole decision — structure, sweeps, zones, retests — lives in
+        # smc.evaluate_entry, the ONE function the backtest above and the
+        # chart's /market/smc endpoint also run. It hands back its working
+        # (`steps`) so the bot log can show what happened at every stage.
+        decision = smc.evaluate_entry(candles)
+        entered = decision["type"] == "BUY"
+        confidence = decision["confidence"]
+        reason = decision["reason"]
+        smc_steps = decision["steps"]
 
     if not entered:
-        return {
+        hold = {
             "type": "HOLD", "strength": 0, "confidence": 0,
             "targetPrice": price, "stopLoss": price,
             "reason": f'"{strategy_name}" — entry condition not met',
         }
+        if smc_steps is not None:
+            # SMC knows exactly why it's waiting — say so instead of the
+            # generic line, and pass the trace on for the bot log.
+            hold["reason"] = f'"{strategy_name}": {reason}'
+            hold["steps"] = smc_steps
+        return hold
 
     # All presets are long-only (matches the backtest runners above). Stop
     # uses the strategy's own tuned stopPct where it has one, so tuning
@@ -736,8 +691,11 @@ def evaluate_preset_live(strategy_name: str, candles: List[dict], parameters: di
     # price actually reaching target more than 40% of the time — but it
     # removes a stacked-against-you payoff structure that was independent
     # of how good the entries were.
-    return {
+    buy = {
         "type": "BUY", "strength": 2, "confidence": confidence,
         "targetPrice": price * (1 + stop_pct * 1.5), "stopLoss": price * (1 - stop_pct),
         "reason": f'"{strategy_name}": {reason}',
     }
+    if smc_steps is not None:
+        buy["steps"] = smc_steps
+    return buy

@@ -7,6 +7,8 @@ import aiohttp
 
 from .config import log
 from .database import get_db, serialize_bot
+from .services import smc
+from .services.botlog import add_log, log_decision_trace
 from .services.market import fetch_binance_tickers, fetch_klines
 from .ws_manager import manager
 
@@ -14,6 +16,37 @@ from .ws_manager import manager
 # (default max-hold when a bot has none configured) — kept in one place so
 # the two can't quietly drift apart on what "one bar" means for a timeframe.
 TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+
+
+def _blog(conn, bot: dict, step: str, message: str, level: str = "info", **kw):
+    """Write a bot-activity log row without ever letting logging interfere
+    with trading — a logging failure is logged to the server console and
+    swallowed, never raised into the bot loop."""
+    try:
+        return add_log(conn, bot, step, message, level, **kw)
+    except Exception as e:  # noqa: BLE001
+        log.warning("bot log write failed (%s): %s", step, e)
+        return None
+
+
+def _uses_smc(conn, bot: dict) -> bool:
+    """True if this bot's strategy runs the Smart Money Concepts preset —
+    directly, inside a confluence panel, or as the rule behind one of the
+    user's own named strategies. Those bots are given the full SMC_WINDOW of
+    candles (the same amount the chart and the backtest use); everything
+    else keeps its existing, smaller window."""
+    strat = bot["strategy"]
+    if strat == "Smart Money Concepts":
+        return True
+    if strat == "CONFLUENCE" and bot["confluence_strategies"]:
+        try:
+            return "Smart Money Concepts" in json.loads(bot["confluence_strategies"])
+        except (json.JSONDecodeError, TypeError):
+            return False
+    row = conn.execute(
+        "SELECT execution FROM strategies WHERE user_id=? AND name=?", (bot["user_id"], strat)
+    ).fetchone()
+    return bool(row and row["execution"] == "Smart Money Concepts")
 
 
 def _compute_current_position(conn, bot_id: str) -> str | None:
@@ -238,7 +271,13 @@ async def bot_simulation_loop():
                     ).fetchone()["n"]
 
                     timeframe = bot["timeframe"] or "15m"
-                    candles = await fetch_klines(session, bot["pair"], timeframe, TIMEFRAME_CANDLES.get(timeframe, 96))
+                    # SMC bots read the same 300-candle window the chart's
+                    # overlays and the backtest use (smc.SMC_WINDOW). At the
+                    # old 60-96 there was barely enough history to find a
+                    # swing, so what the bot "saw" and what the chart drew
+                    # were different pictures of the same market.
+                    n_candles = smc.SMC_WINDOW if _uses_smc(conn, bot) else TIMEFRAME_CANDLES.get(timeframe, 96)
+                    candles = await fetch_klines(session, bot["pair"], timeframe, n_candles)
                     # "can i create a bot that confirms from all or selected
                     # strategies" — Confluence mode takes priority over the
                     # normal single-strategy pipeline below when configured.
@@ -305,7 +344,28 @@ async def bot_simulation_loop():
                          ta.get("reason", ""), bot["id"]),
                     )
 
+                    # ── Activity log: what this cycle looked at and decided ──
+                    tf_tag = timeframe
+                    if len(candles) < 30:
+                        _blog(conn, bot, "SCAN", f"[{tf_tag}] Only {len(candles)} candles available for {bot['pair']} — waiting for market data",
+                              "warn", sig="scan-few")
+                    else:
+                        _blog(conn, bot, "SCAN",
+                              f"[{tf_tag}] Watching {bot['pair']} @ {price:.6g} — {len(candles)} candles, strategy \"{bot['strategy']}\", {bot['status']}",
+                              sig="scan")
+                    if ta.get("steps"):
+                        # Smart Money Concepts: one line per process step
+                        # (structure, sweep, zones, retest, decision).
+                        log_decision_trace(conn, bot, ta["steps"], tf_tag)
+                    else:
+                        _blog(conn, bot, "DECISION",
+                              f"[{tf_tag}] {ta['type']} ({ta.get('confidence') or 0:.0f}%) — {ta.get('reason', '')}",
+                              "ok" if ta["type"] == "BUY" else "info", sig=f"decision:{ta['type']}")
+                    is_signal = ta["type"] == "BUY"
+
                     if bot["status"] != "RUNNING":
+                        if is_signal:
+                            _blog(conn, bot, "GATE", f"[{tf_tag}] Signal seen but bot is {bot['status']} — not trading", "warn", sig="gate-paused")
                         continue  # PAUSED: show the market read, but never open a new trade
 
                     # "improve to place often that work" — a bot used to be
@@ -318,6 +378,8 @@ async def bot_simulation_loop():
                     # running.
                     max_open = bot["max_open_positions"] or 1
                     if already_open >= max_open:
+                        if is_signal:
+                            _blog(conn, bot, "GATE", f"[{tf_tag}] Signal skipped — already holding {already_open}/{max_open} position(s); waiting for an exit", "info", sig="gate-maxopen")
                         continue  # position_monitor_loop will close them on SL/TP
 
                     # "stop after how many trades" — a lifetime trade-count
@@ -332,6 +394,7 @@ async def bot_simulation_loop():
                     if max_trades > 0 and bot["trades"] >= max_trades:
                         conn.execute("UPDATE bots SET status='PAUSED' WHERE id=?", (bot["id"],))
                         log.info("Bot %s auto-paused after reaching its %d-trade limit", bot["id"], max_trades)
+                        _blog(conn, bot, "GATE", f"Auto-paused — reached its {max_trades}-trade limit", "warn", always=True)
                         await manager.send_to_user(bot["user_id"], {
                             "type": "BOT_ERROR",
                             "data": {
@@ -378,6 +441,9 @@ async def bot_simulation_loop():
                             (bot["id"],),
                         ).fetchone()
                         if last_trade and (time.time() - last_trade["created_at"]) / 60 < min_spacing:
+                            if is_signal:
+                                left = min_spacing - (time.time() - last_trade["created_at"]) / 60
+                                _blog(conn, bot, "GATE", f"[{tf_tag}] Signal skipped — cooldown, {left:.0f} min left of {min_spacing}", "info", sig="gate-cooldown")
                             continue
 
                     if is_live:
@@ -388,6 +454,7 @@ async def bot_simulation_loop():
                             # already force-stops LIVE bots — this is a defensive
                             # fallback in case that ever gets out of sync).
                             conn.execute("UPDATE bots SET status='STOPPED' WHERE id=?", (bot["id"],))
+                            _blog(conn, bot, "ERROR", "Stopped — Binance is no longer connected", "error", always=True)
                             await manager.send_to_user(bot["user_id"], {
                                 "type": "BOT_ERROR",
                                 "data": {"bot_id": bot["id"], "message": f'"{bot["name"]}" stopped — Binance is no longer connected'},
@@ -397,12 +464,17 @@ async def bot_simulation_loop():
 
                     min_confidence = bot["confidence_threshold"] or MIN_CONFIDENCE_DEFAULT
                     if ta["type"] not in ("BUY", "SELL") or ta["confidence"] < min_confidence:
+                        if is_signal:
+                            _blog(conn, bot, "GATE",
+                                  f"[{tf_tag}] Signal skipped — confidence {ta['confidence']:.0f}% is below this bot's {min_confidence:.0f}% threshold",
+                                  "info", sig="gate-confidence")
                         continue
                     risk_row = conn.execute("SELECT risk_per_trade FROM users WHERE id=?", (bot["user_id"],)).fetchone()
                     risk_fraction = risk_row["risk_per_trade"] if risk_row and risk_row["risk_per_trade"] else RISK_FRACTION_DEFAULT
                     risk_amount = bot["capital"] * risk_fraction
                     amount = round(risk_amount / price, 6)
                     if amount <= 0:
+                        _blog(conn, bot, "GATE", f"[{tf_tag}] Signal skipped — position size rounds to zero", "warn", sig="gate-size")
                         continue
 
                     entry_price = price
@@ -420,6 +492,7 @@ async def bot_simulation_loop():
                                 amount = fill["executed_qty"]
                         except Exception as e:
                             log.error("LIVE entry order failed for bot %s: %s", bot["id"], e)
+                            _blog(conn, bot, "ERROR", f"Live entry order FAILED on Binance: {e}", "error", always=True)
                             await manager.send_to_user(bot["user_id"], {
                                 "type": "BOT_ERROR",
                                 "data": {"bot_id": bot["id"], "message": f'Failed to place live order for "{bot["name"]}": {e}'},
@@ -441,6 +514,7 @@ async def bot_simulation_loop():
                         except Exception as e:
                             exchange_exit_error = str(e)
                             log.warning("OCO exit failed for bot %s trade — app-monitored only: %s", bot["id"], e)
+                            _blog(conn, bot, "ORDER", f"Stop/target could not be placed on Binance ({e}) — this position is monitored by the app only", "warn", always=True)
                             await manager.send_to_user(bot["user_id"], {
                                 "type": "BOT_ERROR",
                                 "data": {"bot_id": bot["id"],
@@ -460,6 +534,7 @@ async def bot_simulation_loop():
                         # actually reflects that bot's current tradable equity
                         # rather than just being a number used for sizing math.
                         if bot["capital"] < total + fee:
+                            _blog(conn, bot, "GATE", f"[{tf_tag}] Signal skipped — bot capital {bot['capital']:.2f} is less than the {total + fee:.2f} this position needs", "warn", sig="gate-capital")
                             continue  # not enough capital allocated to this bot for this position size
                         conn.execute("UPDATE bots SET capital = capital - ? WHERE id=?", (total + fee, bot["id"]))
 
@@ -478,6 +553,11 @@ async def bot_simulation_loop():
                          exchange_order_list_id, exchange_exit_error),
                     )
                     new_trades = bot["trades"] + 1
+                    _blog(conn, bot, "ENTRY",
+                          f"[{tf_tag}] {'LIVE' if is_live else 'DEMO'} {ta['type']} {amount:g} @ {entry_price:.6g} | "
+                          f"stop {ta['stopLoss']:.6g} | target {ta['targetPrice']:.6g} | confidence {ta.get('confidence') or 0:.0f}% — {reason}",
+                          "ok", always=True,
+                          data={"trade_id": trade_id, "price": entry_price, "stop": ta["stopLoss"], "target": ta["targetPrice"]})
                     # BUG FIX: this used to blindly set current_position to
                     # whatever direction THIS entry was, and the close path
                     # (below and in position_monitor_loop) blindly cleared it
@@ -709,7 +789,13 @@ async def position_monitor_loop():
                                  _compute_current_position(conn, bot["id"]), new_streak, new_status, bot["id"]),
                             )
                             touched_bots.add(bot["id"])
+                            why = "take-profit hit" if hit_tp else "stop-loss hit" if hit_sl else "max hold time reached"
+                            _blog(conn, bot, "EXIT",
+                                  f"Closed {side} @ {exit_price:.6g} — {why} | P&L {pnl:+.4f} | record {new_wins}W/{new_losses}L",
+                                  "ok" if pnl >= 0 else "warn", always=True,
+                                  data={"trade_id": trade["id"], "pnl": pnl, "exit": exit_price})
                             if should_pause:
+                                _blog(conn, bot, "GATE", f"Auto-paused after {new_streak} losses in a row", "warn", always=True)
                                 log.info("Bot %s auto-paused after %d consecutive losses", bot["id"], new_streak)
                                 await manager.send_to_user(trade["user_id"], {
                                     "type": "BOT_ERROR",
@@ -874,6 +960,10 @@ async def reconcile_exchange_exits_loop():
                                  _compute_current_position(conn, bot["id"]), new_streak,
                                  "PAUSED" if should_pause else bot["status"], bot["id"]),
                             )
+                            _blog(conn, bot, "EXIT",
+                                  f"Closed {trade['side']} @ {exit_price:.6g} — Binance filled the stop/target order | P&L {pnl:+.4f} | record {new_wins}W/{new_losses}L",
+                                  "ok" if pnl >= 0 else "warn", always=True,
+                                  data={"trade_id": trade["id"], "pnl": pnl, "exit": exit_price})
 
                     touched_users.add(trade["user_id"])
                     await manager.send_to_user(trade["user_id"], {

@@ -128,6 +128,23 @@ CREATE TABLE IF NOT EXISTS strategies (
     active INTEGER DEFAULT 1,
     FOREIGN KEY(user_id) REFERENCES users(id)
 );
+
+-- What each bot did and WHY, one row per process step (scan, structure,
+-- sweep, zones, retest, decision, gate, order, entry, exit). Created with
+-- IF NOT EXISTS, so an existing database picks it up on the next start.
+CREATE TABLE IF NOT EXISTS bot_logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bot_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    pair TEXT NOT NULL,
+    ts INTEGER NOT NULL,
+    level TEXT DEFAULT 'info',
+    step TEXT NOT NULL,
+    message TEXT NOT NULL,
+    data TEXT DEFAULT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_bot_logs_bot ON bot_logs(bot_id, id);
+CREATE INDEX IF NOT EXISTS idx_bot_logs_user_pair ON bot_logs(user_id, pair, id);
 """
 
 # Columns added after the original schema shipped. Applied defensively so

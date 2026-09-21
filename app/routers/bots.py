@@ -8,6 +8,7 @@ from ..database import get_db, serialize_bot
 from ..schemas import BotCreate, BotUpdate, ConfluenceBacktestRequest
 from ..security import get_current_user
 from ..services.backtest import run_confluence_backtest
+from ..services.botlog import serialize_rows
 from ..services.market import fetch_klines
 
 router = APIRouter(prefix="/bots", tags=["bots"])
@@ -44,6 +45,46 @@ async def list_bots(user=Depends(get_current_user)):
     rows = conn.execute("SELECT * FROM bots WHERE user_id=? ORDER BY started_at DESC", (user["id"],)).fetchall()
     conn.close()
     return [serialize_bot(r) for r in rows]
+
+
+@router.get("/logs/feed")
+async def logs_feed(
+    pair: str | None = None, since_id: int = 0, limit: int = 150, user=Depends(get_current_user),
+):
+    """Activity log across ALL of this user's bots, optionally narrowed to one
+    pair — what the chart's activity panel polls. `since_id` returns only rows
+    newer than the last one the client already has, so polling stays cheap.
+    Oldest-first, so the client can simply append."""
+    limit = max(1, min(limit, 500))
+    conn = get_db()
+    if pair:
+        rows = conn.execute(
+            "SELECT * FROM bot_logs WHERE user_id=? AND pair=? AND id>? ORDER BY id DESC LIMIT ?",
+            (user["id"], pair, since_id, limit),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM bot_logs WHERE user_id=? AND id>? ORDER BY id DESC LIMIT ?",
+            (user["id"], since_id, limit),
+        ).fetchall()
+    conn.close()
+    return serialize_rows(reversed(rows))
+
+
+@router.get("/{bot_id}/logs")
+async def bot_logs(bot_id: str, since_id: int = 0, limit: int = 200, user=Depends(get_current_user)):
+    """One bot's activity log, oldest-first."""
+    limit = max(1, min(limit, 500))
+    conn = get_db()
+    bot = conn.execute("SELECT id FROM bots WHERE id=? AND user_id=?", (bot_id, user["id"])).fetchone()
+    if not bot:
+        conn.close()
+        raise HTTPException(404, "Bot not found")
+    rows = conn.execute(
+        "SELECT * FROM bot_logs WHERE bot_id=? AND id>? ORDER BY id DESC LIMIT ?", (bot_id, since_id, limit),
+    ).fetchall()
+    conn.close()
+    return serialize_rows(reversed(rows))
 
 
 @router.get("/{bot_id}")
@@ -324,6 +365,7 @@ async def delete_bot(bot_id: str, user=Depends(get_current_user)):
     if bot["mode"] == "DEMO" and bot["capital"]:
         conn.execute("UPDATE users SET balance = balance + ? WHERE id=?", (bot["capital"], user["id"]))
 
+    conn.execute("DELETE FROM bot_logs WHERE bot_id=? AND user_id=?", (bot_id, user["id"]))
     conn.execute("DELETE FROM bots WHERE id=? AND user_id=?", (bot_id, user["id"]))
     conn.commit()
     conn.close()

@@ -24,40 +24,48 @@ async def get_klines(symbol: str, interval: str = "1h", limit: int = 1000, befor
 
 
 @router.get("/smc/{symbol}")
-async def get_smc(symbol: str, interval: str = "1h", limit: int = 300):
-    """Order blocks, fair value gaps, market structure, liquidity sweeps
-    and points of interest — computed by the EXACT SAME functions
-    (app/services/smc.py) the Smart Money Concepts bot strategy trades
-    off of. This is what the chart's OB/FVG/MS/SWEEP/POI overlays call
-    instead of recomputing their own version client-side, so what a bot
-    running that strategy actually saw is provably the same thing the
-    chart shows for that symbol/timeframe — not just a similar-looking
-    approximation of it.
+async def get_smc(symbol: str, interval: str = "1h", limit: int = smc.SMC_WINDOW):
+    """Everything the chart draws for Smart Money Concepts — order blocks,
+    fair value gaps, supply/demand zones, swing structure (HH/HL/LH/LL) and
+    trend, liquidity sweeps, points of interest and retests — PLUS the
+    strategy's own verdict on the newest bar (`decision`, with the step-by-
+    step working the bot logs).
+
+    All of it comes from `smc.analyze()` / `smc.evaluate_entry()`, the same
+    two functions the Smart Money Concepts bot strategy and its backtest run,
+    over the same `SMC_WINDOW` candles. So what's drawn is what the bot saw
+    and `decision` is what it would do — not a lookalike computed elsewhere.
     """
     async with aiohttp.ClientSession() as s:
         candles = await fetch_klines(s, symbol, interval, limit)
     if not candles:
-        return {"orderBlocks": [], "fvgs": [], "structure": {"swings": [], "trend": "ranging"}, "sweeps": [], "poi": []}
+        return {
+            "orderBlocks": [], "fvgs": [], "sdZones": [], "structure": {"swings": [], "trend": "ranging"},
+            "sweeps": [], "poi": [], "retests": [], "decision": None,
+        }
 
-    order_blocks = smc.find_order_blocks(candles)
-    fvgs = smc.find_fair_value_gaps(candles)
-    sd_zones = smc.find_supply_demand_zones(candles)
-    structure = smc.find_market_structure(candles)
-    sweeps = smc.find_liquidity_sweeps(candles, structure["swings"])
-    poi = smc.find_points_of_interest(candles, order_blocks, fvgs, sd_zones)
+    snap = smc.analyze(candles)
+    decision = smc.evaluate_entry(candles, snap)
+
     # smc.py's internal dicts use snake_case (fill_pct) like the rest of
-    # this backend's Python; the frontend's existing OrderBlock/FVG/etc.
-    # interfaces (originally written for the client-side TS version of
-    # these detectors) expect camelCase, matching every other API
-    # response here (see targetPrice/stopLoss in evaluate_preset_live).
+    # this backend's Python; the frontend interfaces expect camelCase,
+    # matching every other API response here.
     def _to_camel(g: dict) -> dict:
         out = dict(g)
         out["fillPct"] = out.pop("fill_pct")
         return out
-    fvgs_out = [_to_camel(g) for g in fvgs]
+
     return {
-        "orderBlocks": order_blocks, "fvgs": fvgs_out, "sdZones": sd_zones,
-        "structure": structure, "sweeps": sweeps, "poi": poi,
+        "orderBlocks": snap["order_blocks"],
+        "fvgs": [_to_camel(g) for g in snap["fvgs"]],
+        "sdZones": snap["sd_zones"],
+        "structure": snap["structure"],
+        "sweeps": snap["sweeps"],
+        "poi": snap["poi"],
+        "retests": snap["retests"],
+        "decision": decision,
+        "candles": len(candles),
+        "lastTime": int(candles[-1]["time"] / 1000),
     }
 
 
