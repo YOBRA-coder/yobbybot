@@ -748,3 +748,202 @@ def evaluate_entry(candles: List[dict], snapshot: Optional[Dict] = None) -> Dict
         "type": "BUY" if entered else "HOLD", "confidence": confidence, "reason": reason,
         "trigger": trigger, "zone": zone, "invalidation": invalidation, "trend": trend, "steps": steps,
     }
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Multi-timeframe additions — BOS / CHoCH, equal highs/lows, premium/discount,
+# trend lines. Kept in THIS module so the chart, the scanner, the bot and the
+# backtest keep reading one set of detectors (see the note at the top).
+# ═══════════════════════════════════════════════════════════════════════════
+from .indicators import calc_atr  # noqa: E402
+
+
+class StructureBreak(TypedDict):
+    time: int        # seconds — the candle that CLOSED through the level
+    level: float
+    from_time: int   # seconds — the swing that was broken
+    kind: str        # "BOS" (continuation) | "CHoCH" (change of character)
+    dir: str         # "bullish" | "bearish"
+
+
+def find_structure_breaks(candles: List[dict], lookback: int = 3, max_events: int = 14) -> Dict:
+    """Break of Structure / Change of Character, on candle CLOSES.
+
+    Walks the candles once, in order, remembering the newest *confirmed*
+    unbroken swing high and swing low (a pivot is only known `lookback` bars
+    after it printed, so nothing here peeks at the future). A close above the
+    swing high is a bullish break; below the swing low a bearish one. It is a
+    BOS when it continues the current trend and a CHoCH when it flips it —
+    the first break after a range is called a BOS. `trend` is the direction of
+    the most recent break (None if none yet).
+    """
+    n = len(candles)
+    events: List[StructureBreak] = []
+    trend: Optional[str] = None
+    hi = lo = None  # (price, time_s)
+    for i in range(n):
+        k = i - lookback
+        if k >= lookback:
+            c = candles[k]
+            win = range(k - lookback, k + lookback + 1)
+            if all(candles[j]["high"] < c["high"] for j in win if j != k):
+                hi = (c["high"], int(c["time"] / 1000))
+            if all(candles[j]["low"] > c["low"] for j in win if j != k):
+                lo = (c["low"], int(c["time"] / 1000))
+        cur = candles[i]
+        t = int(cur["time"] / 1000)
+        if hi is not None and cur["close"] > hi[0]:
+            events.append({"time": t, "level": hi[0], "from_time": hi[1],
+                           "kind": "CHoCH" if trend == "bearish" else "BOS", "dir": "bullish"})
+            trend = "bullish"
+            hi = None
+        elif lo is not None and cur["close"] < lo[0]:
+            events.append({"time": t, "level": lo[0], "from_time": lo[1],
+                           "kind": "CHoCH" if trend == "bullish" else "BOS", "dir": "bearish"})
+            trend = "bearish"
+            lo = None
+    return {"events": events[-max_events:], "trend": trend}
+
+
+class EqualLevel(TypedDict):
+    kind: str     # "EQH" | "EQL"
+    price: float
+    t1: int
+    t2: int
+    swept: bool   # a later candle already ran through it (liquidity taken)
+
+
+def find_equal_levels(candles: List[dict], swings: List[SwingPoint], tol_atr: float = 0.25, max_each: int = 3) -> List[EqualLevel]:
+    """Equal highs / equal lows: two swing points within `tol_atr` x ATR of
+    each other — resting stop liquidity just beyond them."""
+    if len(swings) < 2 or len(candles) < 20:
+        return []
+    tol = max(calc_atr(candles) * tol_atr, candles[-1]["close"] * 0.0002)
+    out: List[EqualLevel] = []
+    for kind, tag in (("high", "EQH"), ("low", "EQL")):
+        pts = [s for s in swings if s["kind"] == kind]
+        found: List[EqualLevel] = []
+        for bi in range(len(pts) - 1, 0, -1):
+            b = pts[bi]
+            for ai in range(bi - 1, max(-1, bi - 4), -1):
+                a = pts[ai]
+                if abs(a["price"] - b["price"]) <= tol:
+                    level = max(a["price"], b["price"]) if kind == "high" else min(a["price"], b["price"])
+                    swept = any(
+                        (c["high"] > level + tol * 0.2) if kind == "high" else (c["low"] < level - tol * 0.2)
+                        for c in candles if int(c["time"] / 1000) > b["time"]
+                    )
+                    found.append({"kind": tag, "price": level, "t1": a["time"], "t2": b["time"], "swept": swept})
+                    break
+            if len(found) >= max_each:
+                break
+        out.extend(found)
+    return out
+
+
+def premium_discount(candles: List[dict], window: int = 80) -> Optional[Dict]:
+    """Dealing range = highest high / lowest low of the last `window` candles.
+    Above 50% is premium (sell side of the range), below discount (buy side)."""
+    if len(candles) < 10:
+        return None
+    seg = candles[-window:]
+    hi = max(c["high"] for c in seg)
+    lo = min(c["low"] for c in seg)
+    if hi <= lo:
+        return None
+    t_hi = next(int(c["time"] / 1000) for c in seg if c["high"] == hi)
+    t_lo = next(int(c["time"] / 1000) for c in seg if c["low"] == lo)
+    price = candles[-1]["close"]
+    pct = (price - lo) / (hi - lo) * 100
+    return {
+        "high": hi, "low": lo, "eq": (hi + lo) / 2, "pct": pct, "t_high": t_hi, "t_low": t_lo,
+        "t_start": int(seg[0]["time"] / 1000),
+        "zone": "premium" if pct > 55 else ("discount" if pct < 45 else "equilibrium"),
+    }
+
+
+def find_trendlines(candles: List[dict], swings: List[SwingPoint]) -> List[Dict]:
+    """Ascending support through the last two rising swing lows and descending
+    resistance through the last two falling swing highs. `broken` once a candle
+    has closed through the projected line after the second touch."""
+    out: List[Dict] = []
+    if len(candles) < 20:
+        return out
+    step = (candles[-1]["time"] - candles[-2]["time"]) / 1000 or 1
+
+    def build(kind: str, pts: List[SwingPoint]) -> None:
+        if len(pts) < 2:
+            return
+        a, b = pts[-2], pts[-1]
+        if b["time"] - a["time"] < step * 4:
+            return
+        if kind == "support" and not b["price"] > a["price"]:
+            return
+        if kind == "resistance" and not b["price"] < a["price"]:
+            return
+        slope = (b["price"] - a["price"]) / (b["time"] - a["time"])
+        broken = False
+        for c in candles:
+            t = int(c["time"] / 1000)
+            if t <= b["time"]:
+                continue
+            line = b["price"] + slope * (t - b["time"])
+            if (kind == "support" and c["close"] < line) or (kind == "resistance" and c["close"] > line):
+                broken = True
+                break
+        out.append({"kind": kind, "t1": a["time"], "p1": a["price"], "t2": b["time"], "p2": b["price"],
+                    "slope": slope, "broken": broken})
+
+    build("support", [s for s in swings if s["kind"] == "low"])
+    build("resistance", [s for s in swings if s["kind"] == "high"])
+    return out
+
+
+def bias_state(analysis: Dict) -> Dict:
+    """One word of direction for a timeframe: the last BOS/CHoCH direction,
+    vetoed to neutral if the swing labels (HH/HL vs LH/LL) point the other way."""
+    bt = (analysis.get("breaks") or {}).get("trend")
+    st = (analysis.get("structure") or {}).get("trend")
+    opp = {"bullish": "bearish", "bearish": "bullish"}
+    if bt in opp and st != opp[bt]:
+        bias = bt
+    elif bt is None and st in opp:
+        bias = st
+    else:
+        bias = "neutral"
+    ev = (analysis.get("breaks") or {}).get("events") or []
+    return {"bias": bias, "break_trend": bt, "swing_trend": st,
+            "last_break": ev[-1] if ev else None,
+            "strength": 2 if (bt == st and bias != "neutral") else (1 if bias != "neutral" else 0)}
+
+
+def analyze_full(candles: List[dict], window: int = SMC_WINDOW) -> Dict:
+    """Everything one timeframe's chart draws AND the multi-timeframe engine
+    reasons over (see services/mtf.py): the classic snapshot plus BOS/CHoCH,
+    equal highs/lows, premium/discount and trend lines, with larger zone limits
+    than the bot-loop's analyze()."""
+    candles = candles[-window:]
+    if len(candles) < 30:
+        return {"empty": True, "atr": 0.0, "order_blocks": [], "fvgs": [], "sd_zones": [],
+                "structure": {"swings": [], "trend": "ranging"}, "breaks": {"events": [], "trend": None},
+                "sweeps": [], "poi": [], "retests": [], "eq": [], "pd": None, "trendlines": []}
+    order_blocks = find_order_blocks(candles, max_blocks=8)
+    fvgs = find_fair_value_gaps(candles, max_gaps=10)
+    sd_zones = find_supply_demand_zones(candles, max_zones=5)
+    all_swings = find_swings(candles)
+    label_swings(all_swings)
+    structure = find_market_structure(candles)
+    sweeps = find_liquidity_sweeps(candles, all_swings[-40:], max_sweeps=8)
+    snap = {
+        "order_blocks": order_blocks, "fvgs": fvgs, "sd_zones": sd_zones, "structure": structure,
+        "sweeps": sweeps,
+        "poi": find_points_of_interest(candles, order_blocks, fvgs, sd_zones),
+        "retests": find_retests(candles, order_blocks, fvgs, sd_zones),
+        "breaks": find_structure_breaks(candles),
+        "eq": find_equal_levels(candles, all_swings),
+        "pd": premium_discount(candles),
+        "trendlines": find_trendlines(candles, all_swings),
+        "atr": calc_atr(candles),
+    }
+    snap["bias"] = bias_state(snap)
+    return snap

@@ -18,6 +18,10 @@ from . import smc
 from .indicators import calc_atr, calc_bb, calc_ema, calc_macd, calc_rsi
 
 PRESETS = ("RSI Scalper", "EMA Cross", "MACD Divergence", "Bollinger Squeeze", "Grid Trading", "Smart Money Concepts")
+# The top-down 4H -> 1H -> entry engine (services/mtf.py). Deliberately NOT in
+# PRESETS: it needs several timeframes at once, so it can't be one leg of a
+# single-timeframe Confluence panel. Bots and custom strategies accept it by name.
+MTF_PRESET = "SMC Multi-Timeframe"
 
 # Tunable knobs per preset, seeded onto a new Strategy row at creation time
 # and read back here on every run. Before this, every "RSI Scalper"
@@ -42,6 +46,7 @@ DEFAULT_PARAMS = {
     # for normal noise around that level rather than being clipped
     # immediately by a tight stop.
     "Smart Money Concepts": {"stopPct": 2.5, "riskReward": 2.0},
+    MTF_PRESET: {"minAgree": 70},
 }
 
 
@@ -286,7 +291,56 @@ def _run_smart_money(candles: List[dict], params: dict) -> List[BacktestTrade]:
     return trades
 
 
+def _resample(candles: List[dict], ms: int) -> List[dict]:
+    out: List[dict] = []
+    for c in candles:
+        b = int(c["time"] // ms * ms)
+        if out and out[-1]["time"] == b:
+            o = out[-1]
+            o["high"] = max(o["high"], c["high"])
+            o["low"] = min(o["low"], c["low"])
+            o["close"] = c["close"]
+            o["volume"] += c["volume"]
+        else:
+            out.append({"time": b, "open": c["open"], "high": c["high"], "low": c["low"], "close": c["close"], "volume": c["volume"]})
+    return out
+
+
+def _run_smc_mtf(candles: List[dict], params: dict) -> List[BacktestTrade]:
+    """Top-down SMC (services/mtf.py) replayed on a single candle list: the
+    strategy's own candles are the ENTRY timeframe and the 15m/1h/4h context is
+    resampled from them, so no extra downloads are needed and nothing peeks at
+    the future (resampled bars only count once they have fully closed).
+
+    Needs an entry timeframe of 30m or lower. Long-only (spot). For a proper
+    multi-month test with real 4H/1H history use the dashboard's MTF backtest
+    (/market/mtf/backtest/{symbol})."""
+    from . import mtf
+    if len(candles) < 2:
+        return []
+    ms = int(candles[1]["time"] - candles[0]["time"])
+    tf = next((k for k, v in mtf.TF_MS.items() if v == ms), None)
+    if tf is None or ms > mtf.TF_MS["30m"]:
+        return []
+    style = "intraday" if ms >= mtf.TF_MS["15m"] else "scalp"
+    frames = {tf: candles}
+    for t in ("15m", "1h", "4h"):
+        if mtf.TF_MS[t] > ms:
+            frames[t] = _resample(candles, mtf.TF_MS[t])
+    res = mtf.backtest(frames, style, tf, params.get("minAgree", 70), long_only=True, keep_all=True)
+    out: List[BacktestTrade] = []
+    for t in res["trade_log"]:
+        pnl = (t["exit"] - t["entry"]) / t["entry"] - 0.002
+        out.append({
+            "side": "BUY", "entry_time": t["entry_time"] * 1000, "entry_price": t["entry"],
+            "exit_time": t["exit_time"] * 1000, "exit_price": t["exit"],
+            "pnl": pnl, "pnl_pct": pnl * 100, "result": "WIN" if pnl >= 0 else "LOSS",
+        })
+    return out
+
+
 RUNNERS = {
+    MTF_PRESET: _run_smc_mtf,
     "RSI Scalper": _run_rsi_scalper,
     "EMA Cross": _run_ema_cross,
     "MACD Divergence": _run_macd_divergence,

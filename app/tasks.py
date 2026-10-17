@@ -7,7 +7,8 @@ import aiohttp
 
 from .config import log
 from .database import get_db, serialize_bot
-from .services import smc
+from .services import mtf, scanner, smc
+from .services.backtest import MTF_PRESET
 from .services.botlog import add_log, log_decision_trace
 from .services.market import fetch_binance_tickers, fetch_klines
 from .ws_manager import manager
@@ -15,7 +16,7 @@ from .ws_manager import manager
 # Shared by bot_simulation_loop (entry pacing) and position_monitor_loop
 # (default max-hold when a bot has none configured) — kept in one place so
 # the two can't quietly drift apart on what "one bar" means for a timeframe.
-TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "1h": 60, "4h": 240, "1d": 1440}
+TIMEFRAME_MINUTES = {"1m": 1, "5m": 5, "15m": 15, "30m": 30, "1h": 60, "4h": 240, "1d": 1440}
 
 
 def _blog(conn, bot: dict, step: str, message: str, level: str = "info", **kw):
@@ -47,6 +48,46 @@ def _uses_smc(conn, bot: dict) -> bool:
         "SELECT execution FROM strategies WHERE user_id=? AND name=?", (bot["user_id"], strat)
     ).fetchone()
     return bool(row and row["execution"] == "Smart Money Concepts")
+
+
+def _uses_mtf(conn, bot: dict) -> bool:
+    """True if this bot runs the top-down multi-timeframe SMC engine — directly,
+    or as the rule behind one of the user's own named strategies."""
+    strat = bot["strategy"]
+    if strat == MTF_PRESET:
+        return True
+    row = conn.execute(
+        "SELECT execution FROM strategies WHERE user_id=? AND name=?", (bot["user_id"], strat)
+    ).fetchone()
+    return bool(row and row["execution"] == MTF_PRESET)
+
+
+async def evaluate_mtf_live(session, bot: dict, entry_tf: str, min_agree: float = 70) -> dict:
+    """The bot-facing wrapper around mtf.evaluate_all: fetches 4h/1h/entry
+    (+ scalp frames), returns a `ta` dict in the same shape as the other presets
+    (type BUY|HOLD, confidence, stopLoss, targetPrice, reason, steps). The engine
+    also sees bearish setups (reported in the trace / dashboard) but a spot bot
+    only ever acts on BUY."""
+    mode = "scalp" if entry_tf in ("1m", "3m", "5m") else "intraday"
+    tfs = mtf.needed_timeframes(mode, entry_tf)
+    frames = await scanner.load_frames(session, bot["pair"], tfs)
+    if not all(frames.get(tf) for tf in tfs):
+        n = min((len(frames.get(tf) or []) for tf in tfs), default=0)
+        return {"type": "HOLD", "confidence": 0, "reason": f"Waiting for {', '.join(tfs)} candles ({n} loaded)",
+                "steps": [{"step": "DATA", "status": "wait", "message": f"Waiting for candles on {', '.join(tfs)}", "sig": "few"}],
+                "targetPrice": None, "stopLoss": None}
+    res = await asyncio.to_thread(mtf.evaluate_all, frames, mode, entry_tf, min_agree, time.time() * 1000)
+    dec = res["decision"]
+    if dec["type"] == "SELL":
+        dec = dict(dec)
+        dec["type"] = "HOLD"
+        dec["reason"] = f"SELL setup seen ({dec['agreement']}%) — spot bots are long-only, no trade"
+    if dec["type"] == "BUY":
+        try:
+            scanner.record_signal(bot["pair"], res["decision"])
+        except Exception:  # noqa: BLE001
+            pass
+    return dec
 
 
 def _compute_current_position(conn, bot_id: str) -> str | None:
@@ -103,6 +144,25 @@ async def kline_loop():
             except Exception as e:
                 log.error("Kline loop error: %s", e)
             await asyncio.sleep(2)
+
+
+async def mtf_scanner_loop():
+    """Every minute: scan all pairs with the default top-down settings (this keeps
+    the candle store filled and the dashboard's scanner warm), record fired
+    signals, and settle open ones against later candles."""
+    await asyncio.sleep(5)
+    while True:
+        try:
+            await scanner.scan_all(*scanner.DEFAULT_KEY)
+            changed = await asyncio.to_thread(scanner.resolve_signals)
+            if changed:
+                log.info("MTF signals settled: %d", changed)
+            await scanner.send_alerts()
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:  # noqa: BLE001
+            log.warning("mtf scanner loop error: %s", e)
+        await asyncio.sleep(60)
 
 
 async def auto_signal_loop():
@@ -223,7 +283,7 @@ async def bot_simulation_loop():
     # context for a 4h/1d strategy to evaluate meaningfully. ~10 days for
     # 4h, ~2 months for 1d — both comfortably past evaluate_preset_live's
     # own 30-candle minimum.
-    TIMEFRAME_CANDLES = {"1m": 120, "5m": 120, "15m": 96, "1h": 60, "4h": 60, "1d": 60}
+    TIMEFRAME_CANDLES = {"1m": 120, "5m": 120, "15m": 96, "30m": 96, "1h": 60, "4h": 60, "1d": 60}
 
     async with aiohttp.ClientSession() as session:
         while True:
@@ -281,7 +341,9 @@ async def bot_simulation_loop():
                     # "can i create a bot that confirms from all or selected
                     # strategies" — Confluence mode takes priority over the
                     # normal single-strategy pipeline below when configured.
-                    if bot["strategy"] == "CONFLUENCE" and bot["confluence_strategies"]:
+                    if _uses_mtf(conn, bot):
+                        ta = await evaluate_mtf_live(session, bot, timeframe)
+                    elif bot["strategy"] == "CONFLUENCE" and bot["confluence_strategies"]:
                         try:
                             confluence_list = json.loads(bot["confluence_strategies"])
                         except (json.JSONDecodeError, TypeError):

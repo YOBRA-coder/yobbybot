@@ -145,6 +145,34 @@ CREATE TABLE IF NOT EXISTS bot_logs (
 );
 CREATE INDEX IF NOT EXISTS idx_bot_logs_bot ON bot_logs(bot_id, id);
 CREATE INDEX IF NOT EXISTS idx_bot_logs_user_pair ON bot_logs(user_id, pair, id);
+
+-- Signals fired by the multi-timeframe SMC scanner (services/scanner.py), kept
+-- so the dashboard can show history + win rate and outcomes can be tracked.
+CREATE TABLE IF NOT EXISTS mtf_signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    symbol TEXT NOT NULL,
+    style TEXT NOT NULL,
+    entry_tf TEXT NOT NULL,
+    side TEXT NOT NULL,
+    entry REAL NOT NULL,
+    sl REAL NOT NULL,
+    tp REAL NOT NULL,
+    rr REAL DEFAULT 2,
+    agreement REAL DEFAULT 0,
+    grade TEXT DEFAULT '',
+    zone TEXT DEFAULT '',
+    zone_key TEXT NOT NULL,
+    reason TEXT DEFAULT '',
+    bar_time INTEGER NOT NULL,
+    created_at INTEGER NOT NULL,
+    status TEXT DEFAULT 'OPEN',
+    closed_at INTEGER DEFAULT NULL,
+    exit_price REAL DEFAULT NULL,
+    r_result REAL DEFAULT NULL,
+    notified INTEGER DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_mtf_signals_status ON mtf_signals(status, id);
+CREATE INDEX IF NOT EXISTS idx_mtf_signals_key ON mtf_signals(zone_key, created_at);
 """
 
 # Columns added after the original schema shipped. Applied defensively so
@@ -269,6 +297,8 @@ MIGRATIONS = [
     #    the UI so "your stop is NOT on the exchange" is never silent.
     ("trades", "exchange_order_list_id", "TEXT DEFAULT NULL"),
     ("trades", "exchange_exit_error", "TEXT DEFAULT NULL"),
+    # 0 = nothing sent, 1 = entry alert sent, 2 = result alert sent
+    ("mtf_signals", "notified", "INTEGER DEFAULT 0"),
 ]
 
 

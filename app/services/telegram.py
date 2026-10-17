@@ -28,3 +28,28 @@ def format_signal_message(s: dict) -> str:
         f"{'🤖 <i>AI-powered signal</i>' if s['ai_generated'] else ''}\n"
         f"⚡ NexusAI Trading Platform"
     )
+
+
+def _px(p: float) -> str:
+    return f"{p:,.2f}" if p >= 100 else f"{p:.4f}" if p >= 1 else f"{p:.6f}"
+
+
+def format_mtf_signal(r: dict) -> str:
+    emoji = "🟢" if r["side"] == "BUY" else "🔴"
+    return (
+        f"{emoji} <b>{r['side']} {r['symbol']}</b> · {r['style']} {r['entry_tf']} · grade {r['grade']} ({r['agreement']:.0f}%)\n\n"
+        f"Entry: <code>{_px(r['entry'])}</code>\n"
+        f"Stop: <code>{_px(r['sl'])}</code>\n"
+        f"Target: <code>{_px(r['tp'])}</code>  ({r['rr']}R)\n\n"
+        f"📍 {r['zone']}\n"
+        f"📝 {r['reason']}\n\n"
+        f"<i>Not financial advice — manage your own risk.</i>"
+    )
+
+
+def format_mtf_result(r: dict) -> str:
+    win = r["status"] == "WIN"
+    return (
+        f"{'✅' if win else '❌'} <b>{r['symbol']} {r['side']} {r['status']}</b> "
+        f"({r['r_result']:+.1f}R) — entry {_px(r['entry'])}, exit {_px(r['exit_price'] or 0)}"
+    )

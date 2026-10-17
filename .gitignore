@@ -3,4 +3,6 @@ __pycache__/
 .venv/
 nexusai.db
 nexusai.db-journal
+cryptosignal.db
+cryptosignal.db-journal
 .encryption_key

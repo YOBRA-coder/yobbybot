@@ -222,9 +222,10 @@ class StrategyCreate(BaseModel):
     @field_validator("execution")
     @classmethod
     def execution_valid(cls, v):
-        from .services.backtest import PRESETS
-        if v not in PRESETS:
-            raise ValueError(f"execution must be one of: {', '.join(PRESETS)}")
+        from .services.backtest import PRESETS, MTF_PRESET
+        allowed = PRESETS + (MTF_PRESET,)
+        if v not in allowed:
+            raise ValueError(f"execution must be one of: {', '.join(allowed)}")
         return v
 
     @field_validator("timeframe")
