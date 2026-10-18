@@ -6,10 +6,35 @@ import logging
 import os
 from pathlib import Path
 
-SECRET_KEY = os.getenv("SECRET_KEY", "nexusai-super-secret-key-change-in-production")
 ALGORITHM = "HS256"
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+
+def _secret_key() -> str:
+    """Token-signing key. Use SECRET_KEY from the environment if set; otherwise generate a random one ONCE and keep it
+    in backend/.secret_key (so logins survive restarts). The old built-in default was public — anyone could forge tokens."""
+    env = os.getenv("SECRET_KEY", "").strip()
+    if env and env != "nexusai-super-secret-key-change-in-production":
+        return env
+    f = BASE_DIR / ".secret_key"
+    try:
+        if f.exists() and f.read_text().strip():
+            return f.read_text().strip()
+        import secrets
+        key = secrets.token_hex(32)
+        f.write_text(key)
+        try:
+            f.chmod(0o600)
+        except OSError:
+            pass
+        return key
+    except OSError:
+        import secrets
+        return secrets.token_hex(32)   # read-only disk: valid for this run only (logins reset on restart)
+
+
+SECRET_KEY = _secret_key()
 DB_PATH = BASE_DIR / "nexusai.db"
 
 BINANCE_REST = os.getenv("BINANCE_REST", "https://api.binance.com")

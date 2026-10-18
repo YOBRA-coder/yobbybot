@@ -1,8 +1,5 @@
-__pycache__/
-*.py[cod]
-.venv/
-nexusai.db
-nexusai.db-journal
-cryptosignal.db
-cryptosignal.db-journal
+.secret_key
 .encryption_key
+*.db
+__pycache__/
+.env

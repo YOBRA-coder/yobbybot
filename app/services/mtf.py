@@ -25,6 +25,7 @@ use CLOSED entry candles — so `backtest()` below replays exactly what the live
 scanner would have done.
 """
 import bisect
+import math
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
@@ -49,6 +50,28 @@ STYLES: Dict[str, Dict] = {
 MODES = ("intraday", "scalp", "combined")
 DEFAULT_MIN_AGREE = 70
 ENTRY_TFS = ("1m", "3m", "5m", "15m", "30m")
+# Sensitivity presets — how picky the engine is. `min_agree` is applied by the caller (the UI sets it
+# from the preset); the rest is read inside evaluate_style via `opts`.
+SENSITIVITY: Dict[str, Dict] = {
+    "strict":   {"min_agree": 80, "gate_sweep": True, "gate_killzone": False, "trigger_bars": 2, "touch_mult": 0.75,
+                 "label": "Strict · quality over quantity: needs a liquidity sweep, a fresh trigger and 80% agreement"},
+    "balanced": {"min_agree": 70, "gate_sweep": False, "gate_killzone": False, "trigger_bars": None, "touch_mult": 1.0,
+                 "label": "Balanced · the default GoldSignal rules"},
+    "fast":     {"min_agree": 60, "gate_sweep": False, "gate_killzone": False, "trigger_bars": 5, "touch_mult": 1.5,
+                 "label": "Fast · earlier, more signals: wider touch window, older triggers still count, 60% agreement"},
+}
+OPT_KEYS = ("gate_sweep", "gate_killzone", "trigger_bars", "touch_mult", "rr_intraday", "rr_scalp", "sl_buffer")
+
+
+def opts_for(sens: str = "balanced", custom: Optional[Dict] = None) -> Dict:
+    """Engine options for a sensitivity preset, with optional overrides (rr_*, sl_buffer, gates...)."""
+    o = {k: v for k, v in SENSITIVITY.get(sens, SENSITIVITY["balanced"]).items() if k in OPT_KEYS and v is not None}
+    for k, v in (custom or {}).items():
+        if k in OPT_KEYS and v is not None:
+            o[k] = v
+    return o
+
+
 MIN_RISK_PCT = 0.0015      # stops tighter than 0.15% are eaten by fees
 MAX_RISK_PCT = 0.06
 
@@ -201,12 +224,16 @@ def _empty_result(style: str, entry_tf: str, reason: str) -> Dict:
 # ── the engine ──────────────────────────────────────────────────────────────
 def evaluate_style(
     style: str, ctx_bias: Dict, ctx_setup: Dict, entry: List[dict], entry_tf: str,
-    min_agree: float = DEFAULT_MIN_AGREE, now_ms: Optional[float] = None,
+    min_agree: float = DEFAULT_MIN_AGREE, now_ms: Optional[float] = None, opts: Optional[Dict] = None,
 ) -> Dict:
     """Evaluate ONE style on pre-computed bias/setup analyses (`smc.analyze_full`)
     and the entry-TF candles. If `now_ms` is given and the newest entry candle is
     still forming, it is ignored — decisions are on closed candles."""
     cfg = STYLES[style]
+    opts = opts or {}
+    rr_use = float(opts.get(f"rr_{style}") or cfg["rr"])
+    sl_buf = float(opts.get("sl_buffer") if opts.get("sl_buffer") is not None else 0.25)
+    trig_bars = int(opts.get("trigger_bars") or cfg["trigger_bars"])
     btf, stf = cfg["bias_tf"], cfg["setup_tf"]
     emsg = TF_MS.get(entry_tf, 900_000)
     if now_ms is not None and entry and entry[-1]["time"] + emsg > now_ms:
@@ -257,7 +284,7 @@ def evaluate_style(
                          gate=True))
 
     zones = _aligned_zones(ctx_setup, stf, d) + _aligned_zones(ctx_bias, btf, d)
-    touch_n = cfg["touch_bars"]
+    touch_n = max(2, round(cfg["touch_bars"] * float(opts.get("touch_mult", 1.0))))
     recent = entry[-touch_n:]
     base_idx = len(entry) - len(recent)
     best: Optional[Dict] = None
@@ -318,14 +345,15 @@ def evaluate_style(
         if eqs:
             recent_sweep, src = {"wick": None, "level": eqs[0]["price"]}, f"{ST} {want} already swept"
     checks.append(_check("sweep", 3, "Liquidity swept before the entry", recent_sweep is not None, 10,
-                         src or f"no {'sell' if d == 'bullish' else 'buy'}-side liquidity sweep nearby"))
+                         src or f"no {'sell' if d == 'bullish' else 'buy'}-side liquidity sweep nearby",
+                         gate=bool(opts.get("gate_sweep"))))
 
     # STEP 4 — trigger on the entry TF --------------------------------------
     avg_body = (sum(abs(c["close"] - c["open"]) for c in entry[-21:-1]) / 20) or atr_e * 0.3
     trig = None
     trig_i = None
     if best:
-        for k in range(len(entry) - 1, max(len(entry) - 1 - cfg["trigger_bars"], best["touch_i"] - 1), -1):
+        for k in range(len(entry) - 1, max(len(entry) - 1 - trig_bars, best["touch_i"] - 1), -1):
             if k < 1 or k < best["touch_i"]:
                 break
             name = _is_trigger(entry[k - 1], entry[k], d, avg_body)
@@ -356,7 +384,8 @@ def evaluate_style(
 
     kz = killzone(last_t)
     checks.append(_check("session", 4, "Kill-zone (London / New York)", kz is not None, 4 if style == "intraday" else 6,
-                         f"{kz} session active" if kz else "outside London / New York kill zones"))
+                         f"{kz} session active" if kz else "outside London / New York kill zones",
+                         gate=bool(opts.get("gate_killzone"))))
 
     # trade plan -------------------------------------------------------------
     plan = None
@@ -366,15 +395,15 @@ def evaluate_style(
         if d == "bullish":
             anchor = min([best["bottom"], min(c["low"] for c in entry[best["touch_i"]:])] +
                          ([recent_sweep["wick"]] if recent_sweep and recent_sweep.get("wick") else []))
-            sl = anchor - 0.25 * atr_s
+            sl = anchor - sl_buf * atr_s
             risk = price - sl
         else:
             anchor = max([best["top"], max(c["high"] for c in entry[best["touch_i"]:])] +
                          ([recent_sweep["wick"]] if recent_sweep and recent_sweep.get("wick") else []))
-            sl = anchor + 0.25 * atr_s
+            sl = anchor + sl_buf * atr_s
             risk = sl - price
         if risk > 0:
-            tp = price + sign * risk * cfg["rr"]
+            tp = price + sign * risk * rr_use
             opp = _opposing_levels([(stf, ctx_setup), (btf, ctx_bias)], d, price)
             nearest = opp[0] if opp else None
             room_rr = abs(nearest[0] - price) / risk if nearest else None
@@ -383,7 +412,7 @@ def evaluate_style(
             room_ok = room_rr is None or room_rr >= cfg["min_rr"]
             plan_ok = sane and room_ok
             plan = {
-                "side": side, "entry": price, "sl": sl, "tp": tp, "rr": cfg["rr"], "risk_pct": risk_pct * 100,
+                "side": side, "entry": price, "sl": sl, "tp": tp, "rr": rr_use, "risk_pct": risk_pct * 100,
                 "ideal_entry": (best["top"] + best["bottom"]) / 2,
                 "target_liquidity": {"price": nearest[0], "label": nearest[1], "rr": room_rr} if nearest else None,
             }
@@ -476,6 +505,7 @@ _STATE_RANK = {"SIGNAL": 3, "SETUP": 2, "WATCH": 1, "STAND_ASIDE": 0}
 def evaluate_all(
     frames: Dict[str, List[dict]], mode: str = "combined", entry_tf: str = "15m",
     min_agree: float = DEFAULT_MIN_AGREE, now_ms: Optional[float] = None, ctx_cache: Optional[Dict] = None,
+    opts: Optional[Dict] = None,
 ) -> Dict:
     """Run the requested style(s) over `frames` ({tf: candles}); returns
     {"decision": best, "styles": {...}, "analysis": {tf: analyze_full}}."""
@@ -496,7 +526,7 @@ def evaluate_all(
         et = _entry_for(name, entry_tf)
         st = STYLES[name]
         results[name] = evaluate_style(name, ctx(st["bias_tf"]), ctx(st["setup_tf"]), frames.get(et) or [], et,
-                                       min_agree, now_ms)
+                                       min_agree, now_ms, opts)
     best = max(results.values(), key=lambda r: (_STATE_RANK[r["state"]], r["agreement"]))
     return {"decision": best, "styles": results, "analysis": ctxs}
 
@@ -539,6 +569,8 @@ def backtest(
     frames: Dict[str, List[dict]], style: str = "intraday", entry_tf: str = "15m",
     min_agree: float = DEFAULT_MIN_AGREE, fee_pct: float = 0.1, long_only: bool = False,
     max_hold_bars: int = 300, warmup: int = 60, keep_all: bool = False,
+    opts: Optional[Dict] = None, slippage_pct: float = 0.0, min_grade: str = "D", breakeven_at_r: float = 0.0,
+    killzone_only: bool = False, vote_fn=None,
 ) -> Dict:
     """Replay the engine bar by bar on stored/real history with NO look-ahead:
     at each closed entry bar the bias/setup analyses only contain HTF candles
@@ -568,41 +600,55 @@ def backtest(
     while i < len(ent):
         t_close = ent[i]["time"] + emsg
         res = evaluate_style(style, ctx(cfg["bias_tf"], t_close), ctx(cfg["setup_tf"], t_close),
-                             ent[max(0, i - 150):i + 1], et, min_agree, None)
-        if res["type"] in ("BUY", "SELL") and res["plan"] and not (long_only and res["type"] == "SELL"):
+                             ent[max(0, i - 150):i + 1], et, min_agree, None, opts)
+        ok_filter = (GRADE_RANK.get(res["grade"], 0) >= GRADE_RANK.get(min_grade, 0)
+                     and (not killzone_only or killzone(ent[i]["time"] / 1000) is not None))
+        if ok_filter and vote_fn is not None and res["type"] in ("BUY", "SELL"):
+            ok_filter = vote_fn(ent[max(0, i - 250):i + 1], res["type"])
+        if ok_filter and res["type"] in ("BUY", "SELL") and res["plan"] and not (long_only and res["type"] == "SELL"):
             p = res["plan"]
             entry_px, sl, tp = p["entry"], p["sl"], p["tp"]
             risk = abs(entry_px - sl)
             long = res["type"] == "BUY"
             exit_px, outcome, j = None, "TIMEOUT", i
+            cur_sl, be_armed = sl, False
             for j in range(i + 1, min(len(ent), i + 1 + max_hold_bars)):
                 c = ent[j]
-                hit_sl = c["low"] <= sl if long else c["high"] >= sl
+                hit_sl = c["low"] <= cur_sl if long else c["high"] >= cur_sl
                 hit_tp = c["high"] >= tp if long else c["low"] <= tp
                 if hit_sl:                       # SL first when both are inside one bar
-                    exit_px, outcome = sl, "LOSS"
+                    exit_px, outcome = cur_sl, ("BE" if be_armed else "LOSS")
                     break
                 if hit_tp:
                     exit_px, outcome = tp, "WIN"
                     break
+                if breakeven_at_r > 0 and not be_armed:      # stop moves to entry from the NEXT bar
+                    reached = (c["high"] - entry_px) >= breakeven_at_r * risk if long else (entry_px - c["low"]) >= breakeven_at_r * risk
+                    if reached:
+                        be_armed, cur_sl = True, entry_px
             else:
                 j = min(len(ent), i + 1 + max_hold_bars) - 1
                 exit_px = ent[j]["close"]
-            gross_r = ((exit_px - entry_px) if long else (entry_px - exit_px)) / risk
+            slip = slippage_pct / 100 * entry_px           # adverse move on entry and on exit
+            e_fill = entry_px + slip if long else entry_px - slip
+            x_fill = exit_px - slip if long else exit_px + slip
+            gross_r = ((x_fill - e_fill) if long else (e_fill - x_fill)) / risk
             fee_r = (2 * fee_pct / 100 * entry_px) / risk
             net_r = gross_r - fee_r
-            if outcome == "TIMEOUT":
+            if outcome in ("TIMEOUT", "BE"):
                 outcome = "WIN" if net_r > 0 else "LOSS"
             trades.append({
                 "side": res["type"], "entry_time": int(ent[i]["time"] / 1000), "exit_time": int(ent[j]["time"] / 1000),
                 "entry": entry_px, "sl": sl, "tp": tp, "exit": exit_px, "result": outcome,
                 "r": round(net_r, 3), "agreement": res["agreement"], "grade": res["grade"],
                 "zone": f"{res['zone']['tf']} {res['zone']['src']}" if res.get("zone") else "",
+                "bars_held": j - i, "style": style,
             })
             i = j + 1
             continue
         i += 1
 
+    stats = trade_stats(trades)
     wins = [t for t in trades if t["result"] == "WIN"]
     gross_win = sum(t["r"] for t in trades if t["r"] > 0)
     gross_loss = -sum(t["r"] for t in trades if t["r"] < 0)
@@ -617,7 +663,68 @@ def backtest(
         "win_rate": round(len(wins) / len(trades) * 100, 1) if trades else 0.0,
         "net_r": round(equity, 2), "avg_r": round(equity / len(trades), 3) if trades else 0.0,
         "profit_factor": round(gross_win / gross_loss, 2) if gross_loss > 0 else (None if not trades else 99.0),
-        "max_drawdown_r": round(dd, 2), "equity": curve, "trade_log": trades if keep_all else trades[-60:],
+        "max_drawdown_r": round(dd, 2), "equity": curve, "trade_log": trades[-600:], "stats": stats,
         "from": int(ent[0]["time"] / 1000) if ent else None, "to": int(ent[-1]["time"] / 1000) if ent else None,
-        "note": "Fees included, no slippage. R = multiples of the risked stop distance.",
+        "note": f"Fees {fee_pct}%/side and slippage {slippage_pct}% included. R = multiples of the risked stop distance.",
+    }
+
+
+GRADE_RANK = {"D": 0, "C": 1, "B": 2, "A": 3, "A+": 4}
+
+
+def trade_stats(trades: List[Dict]) -> Dict:
+    """Extra statistics for the advanced backtest view (pure function, unit-tested)."""
+    n = len(trades)
+    if not n:
+        return {"expectancy_r": 0, "avg_win_r": 0, "avg_loss_r": 0, "best_r": 0, "worst_r": 0, "max_win_streak": 0,
+                "max_loss_streak": 0, "avg_bars_held": 0, "sharpe_r": None, "by_side": {}, "by_grade": {}, "by_hour": {},
+                "by_weekday": {}, "by_month": {}, "dist": [], "drawdown": []}
+    rs = [t["r"] for t in trades]
+    wins = [r for r in rs if r > 0]
+    losses = [r for r in rs if r <= 0]
+    mean = sum(rs) / n
+    var = sum((r - mean) ** 2 for r in rs) / n
+    streak_w = streak_l = cur_w = cur_l = 0
+    for r in rs:
+        cur_w, cur_l = (cur_w + 1, 0) if r > 0 else (0, cur_l + 1)
+        streak_w, streak_l = max(streak_w, cur_w), max(streak_l, cur_l)
+
+    def group(keyf) -> Dict[str, Dict]:
+        out: Dict[str, Dict] = {}
+        for t in trades:
+            g = out.setdefault(str(keyf(t)), {"trades": 0, "wins": 0, "net_r": 0.0})
+            g["trades"] += 1
+            g["wins"] += 1 if t["r"] > 0 else 0
+            g["net_r"] = round(g["net_r"] + t["r"], 3)
+        for g in out.values():
+            g["win_rate"] = round(g["wins"] / g["trades"] * 100, 1)
+        return out
+
+    def dt(t):
+        return datetime.fromtimestamp(t["entry_time"], tz=timezone.utc)
+
+    lo, hi = min(rs), max(rs)
+    bins = 12
+    width = (hi - lo) / bins or 1.0
+    dist = [0] * bins
+    for r in rs:
+        dist[min(bins - 1, int((r - lo) / width))] += 1
+    eq = peak = 0.0
+    dd_curve = []
+    for t in trades:
+        eq += t["r"]
+        peak = max(peak, eq)
+        dd_curve.append({"time": t["exit_time"], "dd": round(eq - peak, 3)})
+    return {
+        "expectancy_r": round(mean, 3),
+        "avg_win_r": round(sum(wins) / len(wins), 3) if wins else 0,
+        "avg_loss_r": round(sum(losses) / len(losses), 3) if losses else 0,
+        "best_r": round(hi, 3), "worst_r": round(lo, 3), "max_win_streak": streak_w, "max_loss_streak": streak_l,
+        "avg_bars_held": round(sum(t.get("bars_held", 0) for t in trades) / n, 1),
+        "sharpe_r": round(mean / math.sqrt(var), 2) if var > 0 else None,
+        "by_side": group(lambda t: t["side"]), "by_grade": group(lambda t: t["grade"]),
+        "by_hour": group(lambda t: f"{dt(t).hour:02d}"), "by_weekday": group(lambda t: dt(t).strftime("%a")),
+        "by_month": group(lambda t: dt(t).strftime("%Y-%m")),
+        "dist": [{"from": round(lo + k * width, 2), "to": round(lo + (k + 1) * width, 2), "n": c} for k, c in enumerate(dist)],
+        "drawdown": dd_curve,
     }

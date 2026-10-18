@@ -1,9 +1,12 @@
+import asyncio
+
 import aiohttp
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Body, Depends, HTTPException
 
 from ..database import get_db
 from ..schemas import TelegramSettings
 from ..security import get_current_user
+from ..services import engine_config
 from ..services.telegram import send_telegram
 
 router = APIRouter(prefix="/settings", tags=["settings"])
@@ -33,3 +36,14 @@ async def test_telegram(user=Depends(get_current_user)):
     if not ok:
         raise HTTPException(502, "Telegram connection failed")
     return {"ok": True}
+
+
+@router.put("/engine")
+async def update_engine(payload: dict = Body(...), user=Depends(get_current_user)):
+    """Save engine settings (sensitivity, targets, gates, scanner defaults). The background scanner that
+    fires Telegram alerts reads these, so changing them changes which signals are fired."""
+    try:
+        cfg = await asyncio.to_thread(engine_config.set_, payload)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "config": cfg}

@@ -153,7 +153,8 @@ async def mtf_scanner_loop():
     await asyncio.sleep(5)
     while True:
         try:
-            await scanner.scan_all(*scanner.DEFAULT_KEY)
+            a = scanner.default_args()
+            await scanner.scan_all(a["mode"], a["entry_tf"], a["min_agree"], None, a["sens"], a["consensus"], a["weighting"], a["custom"])
             changed = await asyncio.to_thread(scanner.resolve_signals)
             if changed:
                 log.info("MTF signals settled: %d", changed)

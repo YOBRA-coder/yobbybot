@@ -378,6 +378,9 @@ def test_send_alerts_pushes_each_stage_once():
     conn = get_db()
     conn.execute("INSERT OR REPLACE INTO users (id,name,email,password_hash,telegram_token,telegram_chat_id) VALUES ('u1','T','t@x.com','x','tok','chat')")
     conn.commit(); conn.close()
+    cb, cs = _long_setup()
+    dec = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")
+    assert scanner.record_signal("ALERTUSDT", dec)      # self-contained: own fresh signal
     sent = []
 
     async def fake(session, token, chat, msg):
@@ -422,6 +425,81 @@ def test_signal_preview_has_context_and_exit():
     assert pv["signal"]["symbol"] == "PREVUSDT" and pv["bar_ms"] == 900_000
     assert 40 <= len(pv["candles"]) <= 400 and pv["candles"][0]["time"] < t0
     assert scanner.signal_preview(999999) is None
+
+
+def test_sensitivity_presets_change_what_fires():
+    o_strict, o_fast = mtf.opts_for("strict"), mtf.opts_for("fast")
+    assert o_strict["gate_sweep"] is True and o_fast["trigger_bars"] > o_strict["trigger_bars"]
+    assert mtf.SENSITIVITY["strict"]["min_agree"] > mtf.SENSITIVITY["balanced"]["min_agree"] > mtf.SENSITIVITY["fast"]["min_agree"]
+    cb, cs = _long_setup()
+    base = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")
+    assert base["type"] == "BUY"
+    # a bigger target changes the plan; a wider stop buffer moves the stop away
+    wide = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m", opts=mtf.opts_for("balanced", {"rr_intraday": 3.0, "sl_buffer": 0.6}))
+    assert wide["plan"]["rr"] == 3.0 and wide["plan"]["sl"] < base["plan"]["sl"]
+    # overrides ignore unknown keys
+    assert "evil" not in mtf.opts_for("balanced", {"evil": 1})
+
+
+def test_trade_stats_and_streaks():
+    t0 = 1_700_000_000
+    rs = [2, -1, -1, -1, 2, 2, -1]
+    trades = [{"r": r, "result": "WIN" if r > 0 else "LOSS", "side": "BUY" if i % 2 else "SELL", "grade": "A", "entry_time": t0 + i * 3600,
+               "exit_time": t0 + i * 3600 + 900, "bars_held": 5} for i, r in enumerate(rs)]
+    st = mtf.trade_stats(trades)
+    assert st["max_loss_streak"] == 3 and st["max_win_streak"] == 2
+    assert st["expectancy_r"] == round(sum(rs) / len(rs), 3) and st["best_r"] == 2 and st["worst_r"] == -1
+    assert st["by_side"]["BUY"]["trades"] + st["by_side"]["SELL"]["trades"] == 7
+    assert sum(b["n"] for b in st["dist"]) == 7 and st["drawdown"][-1]["dd"] <= 0
+    assert mtf.trade_stats([])["expectancy_r"] == 0
+
+
+def test_backtest_advanced_options_run():
+    frames = {tf: demo_feed.klines("BTCUSDT", tf, n) for tf, n in (("4h", 400), ("1h", 700), ("15m", 1500))}
+    a = mtf.backtest(frames, "intraday", "15m", 60)
+    b = mtf.backtest(frames, "intraday", "15m", 60, slippage_pct=0.1, min_grade="B", breakeven_at_r=1.0,
+                     opts=mtf.opts_for("strict"))
+    assert "stats" in a and b["trades"] <= a["trades"]
+    assert all(t["grade"] in ("B", "A", "A+") for t in b["trade_log"])
+
+
+def test_votes_and_consensus_gate():
+    from app.services import votes
+    cs, su = demo_feed.klines("BTCUSDT", "15m", 600), demo_feed.klines("BTCUSDT", "1h", 600)
+    dec = {"direction": "bullish", "state": "SIGNAL", "type": "BUY", "bias_tf": "4h", "watch": "w"}
+    v = votes.compute({"15m": cs, "1h": su}, "15m", "1h", dec, mtf.TF_MS, None, "best")
+    assert [r["id"] for r in v["votes"]][0] == "smc" and len(v["votes"]) == 7
+    assert -100 <= v["score"] <= 100 and v["buy"] + v["sell"] + v["neutral"] == 7
+    if v["best"]:
+        assert next(r for r in v["votes"] if r["id"] == v["best"]["id"])["weight"] == 3.0
+    # series are aligned with the candles and only ever -1/0/1
+    for fn in votes.SERIES.values():
+        out = fn(cs)
+        assert len(out) == len(cs) and set(out) <= {-1, 0, 1}
+    held = votes.apply_consensus(dec, {"score": -50})
+    assert held["type"] == "HOLD" and held["state"] == "SETUP" and held["vote_blocked"]
+    assert votes.apply_consensus(dec, {"score": 50})["type"] == "BUY"
+    assert votes.apply_consensus({"type": "HOLD"}, {"score": -90})["type"] == "HOLD"
+
+
+def test_engine_config_roundtrip_and_validation():
+    from app.services import engine_config as ec
+    assert ec.get()["sens"] == "balanced"
+    out = ec.set_({"sens": "fast", "min_agree": 62, "rr_intraday": 2.5, "consensus": True, "junk": 1})
+    assert out["sens"] == "fast" and out["min_agree"] == 62 and out["consensus"] is True and "junk" not in out
+    assert ec.custom_opts(ec.get()) == {"rr_intraday": 2.5}
+    for bad in ({"sens": "wild"}, {"min_agree": 10}, {"rr_scalp": 99}, {"mode": "x"}):
+        try:
+            ec.set_(bad)
+            assert False, bad
+        except ValueError:
+            pass
+    ec.set_({"sens": "balanced", "min_agree": 70, "rr_intraday": None, "consensus": False})
+
+
+def test_secret_key_is_not_the_public_default():
+    from app import config
+    assert config.SECRET_KEY and config.SECRET_KEY != "nexusai-super-secret-key-change-in-production" and len(config.SECRET_KEY) >= 32
 
 
 if __name__ == "__main__":
