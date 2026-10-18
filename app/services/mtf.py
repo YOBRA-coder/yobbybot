@@ -30,7 +30,7 @@ from datetime import datetime, timezone
 from typing import Dict, List, Optional, Tuple
 
 from . import smc
-from .indicators import calc_atr
+from .indicators import calc_atr, calc_rsi
 
 TF_MS = {
     "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000, "30m": 1_800_000,
@@ -54,13 +54,17 @@ ENTRY_TFS = ("1m", "3m", "5m", "15m", "30m")
 # from the preset); the rest is read inside evaluate_style via `opts`.
 SENSITIVITY: Dict[str, Dict] = {
     "strict":   {"min_agree": 80, "gate_sweep": True, "gate_killzone": False, "trigger_bars": 2, "touch_mult": 0.75,
+                 "risk_guard": 2, "max_chase_atr": 0.8, "rsi_guard": True, "vol_guard": True,
                  "label": "Strict · quality over quantity: needs a liquidity sweep, a fresh trigger and 80% agreement"},
     "balanced": {"min_agree": 70, "gate_sweep": False, "gate_killzone": False, "trigger_bars": None, "touch_mult": 1.0,
+                 "risk_guard": 1, "max_chase_atr": None, "rsi_guard": True,
                  "label": "Balanced · the default GoldSignal rules"},
     "fast":     {"min_agree": 60, "gate_sweep": False, "gate_killzone": False, "trigger_bars": 5, "touch_mult": 1.5,
+                 "risk_guard": 0, "max_chase_atr": 2.2,
                  "label": "Fast · earlier, more signals: wider touch window, older triggers still count, 60% agreement"},
 }
-OPT_KEYS = ("gate_sweep", "gate_killzone", "trigger_bars", "touch_mult", "rr_intraday", "rr_scalp", "sl_buffer")
+OPT_KEYS = ("gate_sweep", "gate_killzone", "trigger_bars", "touch_mult", "rr_intraday", "rr_scalp", "sl_buffer",
+            "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
 
 
 def opts_for(sens: str = "balanced", custom: Optional[Dict] = None) -> Dict:
@@ -142,6 +146,55 @@ def _outlook(kind: str, state: str, side: str, d: str, ET: str, ST: str, BT: str
                                           else f"Nothing to do until the {ST} structure lines up."),
                  **{"from": int(nxt), "to": int(nxt)}, window=f"Re-check at the next {ST} close.")
     return o
+
+
+def _entry_risk(d: str, price: float, entry: List[dict], trig_i: Optional[int], best: Dict, atr_s: float, atr_e: float,
+                plan: Optional[Dict], pd_ok: Optional[bool], last_t: int, opts: Dict) -> Dict:
+    """How risky is it to enter RIGHT NOW? Each factor adds points; LOW < 1.5 <= MEDIUM < 3 <= HIGH.
+    Risky = chasing price away from the zone, entering after an oversized candle, little room to the next level,
+    a very wide stop, an exhausted RSI, a volatility spike, or the wrong side of the range."""
+    pts, why = 0.0, []
+    away = ((price - best["top"]) if d == "bullish" else (best["bottom"] - price)) / (atr_s or 1)
+    if away > 1.0:
+        pts += 2; why.append(f"chasing: price is {away:.1f}x ATR away from the zone")
+    elif away > 0.5:
+        pts += 1; why.append(f"a little extended: {away:.1f}x ATR from the zone")
+    k = trig_i if trig_i is not None else len(entry) - 1
+    ext = (entry[k]["high"] - entry[k]["low"]) / (atr_s or 1)
+    if ext > 2.0:
+        pts += 2; why.append(f"oversized trigger candle ({ext:.1f}x ATR) — entering after the spike")
+    elif ext > 1.2:
+        pts += 1; why.append(f"big trigger candle ({ext:.1f}x ATR)")
+    if plan:
+        room = (plan.get("target_liquidity") or {}).get("rr")
+        if room is not None and room < 1.0:
+            pts += 2; why.append(f"next liquidity only {room:.1f}R away")
+        elif room is not None and room < 1.8:
+            pts += 1; why.append(f"limited room: next liquidity {room:.1f}R away")
+        if plan["risk_pct"] > 3.0:
+            pts += 1; why.append(f"wide stop ({plan['risk_pct']:.1f}%)")
+    if pd_ok is False:
+        pts += 1; why.append("wrong side of the range (" + ("buying in premium" if d == "bullish" else "selling in discount") + ")")
+    if opts.get("rsi_guard"):
+        rsi = calc_rsi([c["close"] for c in entry[-60:]])
+        if (d == "bullish" and rsi > 76) or (d == "bearish" and rsi < 24):
+            pts += 1.5; why.append(f"RSI {rsi:.0f} is already exhausted")
+    if opts.get("vol_guard") and len(entry) >= 70:
+        base = calc_atr(entry[-70:-15]) or atr_e
+        if base and calc_atr(entry[-15:]) / base > 2.2:
+            pts += 1.5; why.append("volatility spike (ATR more than 2x normal)")
+    if opts.get("avoid_weekend") and datetime.fromtimestamp(last_t, tz=timezone.utc).weekday() >= 5:
+        pts += 1.5; why.append("weekend — thin liquidity")
+    level = "LOW" if pts < 1.5 else "MEDIUM" if pts < 3 else "HIGH"
+    out = {"level": level, "score": round(pts, 1), "reasons": why}
+    if plan:
+        ideal = (best["top"] + best["bottom"]) / 2
+        r = abs(plan["entry"] - plan["sl"])
+        risk_l = abs(ideal - plan["sl"])
+        out["limit_entry"] = ideal
+        out["limit_rr"] = round(abs(plan["tp"] - ideal) / risk_l, 2) if risk_l > 0 else None
+        plan["limit_rr"] = out["limit_rr"]
+    return out
 
 
 MIN_RISK_PCT = 0.0015      # stops tighter than 0.15% are eaten by fees
@@ -311,6 +364,10 @@ def evaluate_style(
     sl_buf = float(opts.get("sl_buffer") if opts.get("sl_buffer") is not None else 0.25)
     trig_bars = int(opts.get("trigger_bars") or cfg["trigger_bars"])
     btf, stf = cfg["bias_tf"], cfg["setup_tf"]
+    chase_lim = float(opts.get("max_chase_atr") or 1.5)
+    guard = int(opts.get("risk_guard") or 0)
+    min_rr_use = float(opts.get("min_room_rr") or cfg["min_rr"])
+    max_rp = float(opts["max_risk_pct"]) / 100 if opts.get("max_risk_pct") else MAX_RISK_PCT
     emsg = TF_MS.get(entry_tf, 900_000)
     if now_ms is not None and entry and entry[-1]["time"] + emsg > now_ms:
         entry = entry[:-1]
@@ -372,6 +429,10 @@ def evaluate_style(
                          f"{ST} bias {setup_b['bias']} (breaks {setup_b['break_trend']}, swings {setup_b['swing_trend']}) vs {BT} {htf_d}",
                          gate=True))
 
+    if opts.get("_fast") and not agree_ok:         # backtest speed-up: this gate alone blocks any signal
+        res = _empty_result(style, entry_tf, "setup timeframe does not agree")
+        res["direction"] = d
+        return res
     zones = _aligned_zones(ctx_setup, stf, d) + _aligned_zones(ctx_bias, btf, d)
     touch_n = max(2, round(cfg["touch_bars"] * float(opts.get("touch_mult", 1.0))))
     recent = entry[-touch_n:]
@@ -392,11 +453,15 @@ def evaluate_style(
         if far_side_broken:
             continue
         away = (price - z["top"]) if d == "bullish" else (z["bottom"] - price)
-        if away > 1.5 * atr_s:
+        if away > chase_lim * atr_s:
             continue  # price already ran away from the zone — chasing
         rank = (1 if z["tf"] == btf else 0, 1 if z["src"] == "OB" else 0, z["strength"])
         if best is None or rank > best["_rank"]:
             best = {**z, "touch_i": touch_i, "_rank": rank}
+    if best is None and opts.get("_fast"):
+        res = _empty_result(style, entry_tf, "no zone touched")
+        res["direction"] = d
+        return res
     if best:
         inside = best["bottom"] <= price <= best["top"]
         checks.append(_check("zone", 3, f"Price at an aligned {ST}/{BT} zone", True, 20,
@@ -497,8 +562,8 @@ def evaluate_style(
             nearest = opp[0] if opp else None
             room_rr = abs(nearest[0] - price) / risk if nearest else None
             risk_pct = risk / price
-            sane = MIN_RISK_PCT <= risk_pct <= MAX_RISK_PCT and 0.15 * atr_s <= risk <= 3.0 * atr_s
-            room_ok = room_rr is None or room_rr >= cfg["min_rr"]
+            sane = MIN_RISK_PCT <= risk_pct <= max_rp and 0.15 * atr_s <= risk <= 3.0 * atr_s
+            room_ok = room_rr is None or room_rr >= min_rr_use
             plan_ok = sane and room_ok
             plan = {
                 "side": side, "entry": price, "sl": sl, "tp": tp, "rr": rr_use, "risk_pct": risk_pct * 100,
@@ -510,9 +575,24 @@ def evaluate_style(
                 parts.append("stop is too tight/wide for this zone")
             parts.append(f"next liquidity {nearest[1]} {_fmt(nearest[0])} = {room_rr:.1f}R" if nearest else "no opposing level in the way")
             if not room_ok:
-                parts.append(f"room {room_rr:.1f}R < required {cfg['min_rr']}R")
+                parts.append(f"room {room_rr:.1f}R < required {min_rr_use}R")
             plan_detail = "; ".join(parts)
     checks.append(_check("plan", 4, "Sane stop and room to target", plan_ok if best else False, 6, plan_detail, gate=True))
+
+    # entry risk — "is this a risky place to be entering?" --------------------
+    pd_chk = next((c for c in checks if c["id"] == "pd"), None)
+    risk_info = _entry_risk(d, price, entry, trig_i, best, atr_s, atr_e, plan, pd_chk["ok"] if pd_chk else None, last_t, opts) if best else None
+    if risk_info:
+        risk_ok = risk_info["level"] == "LOW" if guard >= 2 else risk_info["level"] != "HIGH"
+        rdetail = (f"{risk_info['level']} risk (score {risk_info['score']})" +
+                   (": " + "; ".join(risk_info["reasons"]) if risk_info["reasons"] else ": clean entry"))
+        if risk_info.get("limit_entry") is not None and not risk_ok:
+            rdetail += f" — better: limit near {_fmt(risk_info['limit_entry'])}" + (f" ({risk_info['limit_rr']}R)" if risk_info.get("limit_rr") else "")
+        checks.append(_check("risk", 4, "Entry risk is acceptable", risk_ok, 0, rdetail, gate=bool(guard)))
+    else:
+        risk_ok = True
+        checks.append(_check("risk", 4, "Entry risk is acceptable", None, 0, "needs a zone first"))
+    risk_block = bool(guard) and not risk_ok
 
     # score ------------------------------------------------------------------
     applicable = [c for c in checks if c["ok"] is not None and c["weight"] > 0]
@@ -531,7 +611,11 @@ def evaluate_style(
         if trig is None:
             watch = f"Price is at the {best['tf'].upper()} {best['src']} — waiting for a {ET} confirmation candle ({d})"
         else:
-            watch = f"Setup is there but not complete ({'agreement ' + str(agree) + '% < ' + str(int(min_agree)) + '%' if gates_ok else 'a gate is failing — see checklist'})"
+            if risk_block and risk_info:
+                watch = (f"Entry held back as risky ({risk_info['level']}: {'; '.join(risk_info['reasons'][:2]) or 'see checklist'}) — "
+                         f"wait for a pullback to ~{_fmt(risk_info['limit_entry'])}")
+            else:
+                watch = f"Setup is there but not complete ({'agreement ' + str(agree) + '% < ' + str(int(min_agree)) + '%' if gates_ok else 'a gate is failing — see checklist'})"
     elif agree_ok:
         state = "WATCH"
         cands = []
@@ -557,6 +641,9 @@ def evaluate_style(
 
     outlook = _outlook(kind, state, side, d, ET, ST, BT, last_t, emsg, stf, now_ms, atr_e, price, trig_bars,
                        plan, best, expect, fired, watch)
+    if risk_block and state == "SETUP" and trig is not None:
+        outlook["confirm"] = "A pullback toward the limit-entry level, or a calmer confirmation candle."
+        outlook["scenario"] = watch
 
     # trace for the bot log (same shape as smc.evaluate_entry's steps) -------
     def st(cid):
@@ -591,7 +678,7 @@ def evaluate_style(
         "steps": steps,
         "targetPrice": plan["tp"] if fired else None, "stopLoss": plan["sl"] if fired else None,
         "bias": {"bias": htf_d, "bias_tf": btf, "setup_tf": stf, "last_break": lb},
-        "time": last_t, "kind": kind, "outlook": outlook,
+        "time": last_t, "kind": kind, "outlook": outlook, "entry_risk": risk_info,
     }
 
 
@@ -671,6 +758,7 @@ def backtest(
     max_hold_bars: int = 300, warmup: int = 60, keep_all: bool = False,
     opts: Optional[Dict] = None, slippage_pct: float = 0.0, min_grade: str = "D", breakeven_at_r: float = 0.0,
     killzone_only: bool = False, vote_fn=None,
+    ctx_cache: Optional[Dict] = None, i_from: int = 0, i_to: Optional[int] = None,
 ) -> Dict:
     """Replay the engine bar by bar on stored/real history with NO look-ahead:
     at each closed entry bar the bias/setup analyses only contain HTF candles
@@ -683,7 +771,8 @@ def backtest(
     emsg = TF_MS[et]
     series = {tf: (frames.get(tf) or []) for tf in (cfg["bias_tf"], cfg["setup_tf"])}
     opens = {tf: [c["time"] for c in cs] for tf, cs in series.items()}
-    cache: Dict[Tuple[str, int], Dict] = {}
+    cache: Dict[Tuple[str, int], Dict] = ctx_cache if ctx_cache is not None else {}
+    opts = dict(opts or {}, _fast=True)
 
     def ctx(tf: str, t_close: float) -> Dict:
         # candles of `tf` that were fully closed by t_close
@@ -691,13 +780,14 @@ def backtest(
         key = (tf, n)
         if key not in cache:
             cache[key] = smc.analyze_full(series[tf][max(0, n - smc.SMC_WINDOW):n])
-            if len(cache) > 400:
+            if ctx_cache is None and len(cache) > 400:
                 cache.pop(next(iter(cache)))
         return cache[key]
 
     trades: List[Dict] = []
-    i = max(warmup, 30)
-    while i < len(ent):
+    i = max(warmup, 30, i_from)
+    stop_at = len(ent) if i_to is None else min(len(ent), i_to)
+    while i < stop_at:
         t_close = ent[i]["time"] + emsg
         res = evaluate_style(style, ctx(cfg["bias_tf"], t_close), ctx(cfg["setup_tf"], t_close),
                              ent[max(0, i - 150):i + 1], et, min_agree, None, opts)

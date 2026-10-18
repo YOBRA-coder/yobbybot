@@ -39,6 +39,16 @@ def default_args() -> Dict:
             "consensus": bool(c["consensus"]), "weighting": c["weighting"], "custom": engine_config.custom_opts(c)}
 
 
+def apply_profile(symbol: str, sens: str, min_agree: float, custom: Optional[Dict], use: bool = True):
+    """Per-pair tuned settings (from the backtest optimizer) override the global ones for that pair."""
+    prof = engine_config.profile_for(symbol) if use else {}
+    if not prof:
+        return sens, min_agree, custom, None
+    merged = dict(custom or {})
+    merged.update({k: v for k, v in prof.items() if k in mtf.OPT_KEYS or k in ("rr_intraday", "rr_scalp")})
+    return prof.get("sens", sens), prof.get("min_agree", min_agree), merged, prof
+
+
 def finalize(result: Dict, frames: Dict[str, List[dict]], now_ms: float, consensus: bool, weighting: str) -> Dict:
     """Strategy vote for the chosen decision; with `consensus`, a SIGNAL the vote disagrees with is held back."""
     dec = result["decision"]
@@ -88,13 +98,15 @@ def _row(symbol: str, result: Dict, frames: Dict[str, List[dict]], entry_tf: str
 
 async def scan_symbol(session: aiohttp.ClientSession, symbol: str, mode: str, entry_tf: str, min_agree: float,
                       sens: str = "balanced", consensus: bool = False, weighting: str = "equal",
-                      custom: Optional[Dict] = None) -> Optional[Dict]:
+                      custom: Optional[Dict] = None, use_profile: bool = True) -> Optional[Dict]:
     tfs = mtf.needed_timeframes(mode, entry_tf)
     frames = await load_frames(session, symbol, tfs)
     if not all(frames.get(tf) for tf in tfs):
         return None
     now_ms = time.time() * 1000
-    opts = mtf.opts_for(sens, custom if custom is not None else engine_config.custom_opts(engine_config.get()))
+    custom = custom if custom is not None else engine_config.custom_opts(engine_config.get())
+    sens, min_agree, custom, prof = apply_profile(symbol, sens, min_agree, custom, use_profile)
+    opts = mtf.opts_for(sens, custom)
 
     def work():
         res = mtf.evaluate_all(frames, mode, entry_tf, min_agree, now_ms, None, opts)
@@ -104,12 +116,14 @@ async def scan_symbol(session: aiohttp.ClientSession, symbol: str, mode: str, en
         record_signal(symbol, result["decision"])
     except Exception as e:  # noqa: BLE001
         log.warning("mtf signal record failed for %s: %s", symbol, e)
-    return _row(symbol, result, frames, entry_tf, vt)
+    row = _row(symbol, result, frames, entry_tf, vt)
+    row["tuned"] = bool(prof)
+    return row
 
 
 async def scan_all(mode: str = "combined", entry_tf: str = "15m", min_agree: float = 70, symbols: Optional[List[str]] = None,
                    sens: str = "balanced", consensus: bool = False, weighting: str = "equal",
-                   custom: Optional[Dict] = None) -> List[Dict]:
+                   custom: Optional[Dict] = None, use_profile: bool = True) -> List[Dict]:
     syms = symbols or PAIRS
     sem = asyncio.Semaphore(4)
     rows: List[Dict] = []
@@ -117,7 +131,7 @@ async def scan_all(mode: str = "combined", entry_tf: str = "15m", min_agree: flo
         async def one(sym: str):
             async with sem:
                 try:
-                    r = await scan_symbol(session, sym, mode, entry_tf, min_agree, sens, consensus, weighting, custom)
+                    r = await scan_symbol(session, sym, mode, entry_tf, min_agree, sens, consensus, weighting, custom, use_profile)
                 except Exception as e:  # noqa: BLE001
                     log.warning("scan %s failed: %s", sym, e)
                     r = None
@@ -126,17 +140,17 @@ async def scan_all(mode: str = "combined", entry_tf: str = "15m", min_agree: flo
         await asyncio.gather(*(one(s) for s in syms))
     order = {s: i for i, s in enumerate(syms)}
     rows.sort(key=lambda r: (-mtf._STATE_RANK[r["state"]], -r["agreement"], order.get(r["symbol"], 99)))
-    _cache[(mode, entry_tf, int(min_agree), sens, consensus, weighting)] = {"ts": time.time(), "rows": rows}
+    _cache[(mode, entry_tf, int(min_agree), sens, consensus, weighting, use_profile)] = {"ts": time.time(), "rows": rows}
     return rows
 
 
 async def overview(mode: str, entry_tf: str, min_agree: float, max_age: float = 45, sens: str = "balanced",
-                   consensus: bool = False, weighting: str = "equal") -> Dict:
-    key = (mode, entry_tf, int(min_agree), sens, consensus, weighting)
+                   consensus: bool = False, weighting: str = "equal", use_profile: bool = True) -> Dict:
+    key = (mode, entry_tf, int(min_agree), sens, consensus, weighting, use_profile)
     hit = _cache.get(key)
     if hit and time.time() - hit["ts"] < max_age:
         return {"rows": hit["rows"], "ts": hit["ts"]}
-    rows = await scan_all(mode, entry_tf, min_agree, None, sens, consensus, weighting)
+    rows = await scan_all(mode, entry_tf, min_agree, None, sens, consensus, weighting, None, use_profile)
     return {"rows": rows, "ts": _cache[key]["ts"]}
 
 
@@ -305,10 +319,10 @@ _entry_cache: Dict[tuple, Dict] = {}
 
 
 async def entry_scan(symbol: str, mode: str, min_agree: float, sens: str = "balanced", consensus: bool = False,
-                     weighting: str = "equal", max_age: float = 20) -> Dict:
+                     weighting: str = "equal", max_age: float = 20, use_profile: bool = True) -> Dict:
     """Run the engine once per entry timeframe (1m…30m) so the UI can show which one is ready right now
     and offer to switch to it. Ranked by state, then agreement, then speed (smaller timeframe first)."""
-    key = (symbol, mode, int(min_agree), sens, consensus, weighting)
+    key = (symbol, mode, int(min_agree), sens, consensus, weighting, use_profile)
     hit = _entry_cache.get(key)
     if hit and time.time() - hit["ts"] < max_age:
         return hit["data"]
@@ -320,7 +334,8 @@ async def entry_scan(symbol: str, mode: str, min_agree: float, sens: str = "bala
     async with aiohttp.ClientSession() as s:
         frames = await load_frames(s, symbol, need)
     now_ms = time.time() * 1000
-    opts = mtf.opts_for(sens, engine_config.custom_opts(engine_config.get()))
+    sens, min_agree, custom, _prof = apply_profile(symbol, sens, min_agree, engine_config.custom_opts(engine_config.get()), use_profile)
+    opts = mtf.opts_for(sens, custom)
 
     def work():
         cache: Dict = {}

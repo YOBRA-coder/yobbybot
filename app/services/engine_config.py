@@ -14,6 +14,9 @@ DEFAULTS: Dict = {
     "mode": "combined", "entry_tf": "15m", "min_agree": 70, "sens": "balanced",
     "consensus": False, "weighting": "equal",
     "rr_intraday": None, "rr_scalp": None, "sl_buffer": None, "gate_sweep": None, "gate_killzone": None,
+    "risk_guard": None, "max_chase_atr": None, "min_room_rr": None, "max_risk_pct": None,
+    "rsi_guard": None, "vol_guard": None, "avoid_weekend": None,
+    "profiles": {},          # per-pair tuned settings from the backtest optimizer: {"BTCUSDT": {...}}
 }
 _ready = False
 
@@ -76,10 +79,60 @@ def clean(patch: Dict) -> Dict:
             v = _num(v, 1.0, 6.0)
         elif k == "sl_buffer":
             v = _num(v, 0.0, 2.0)
-        elif k in ("consensus", "gate_sweep", "gate_killzone"):
+        elif k == "risk_guard":
+            v = None if v in (None, "") else int(_num(v, 0, 2))
+        elif k == "max_chase_atr":
+            v = _num(v, 0.3, 4.0)
+        elif k == "min_room_rr":
+            v = _num(v, 0.8, 4.0)
+        elif k == "max_risk_pct":
+            v = _num(v, 0.3, 10.0)
+        elif k == "profiles":
+            v = clean_profiles(v)
+        elif k in ("consensus", "gate_sweep", "gate_killzone", "rsi_guard", "vol_guard", "avoid_weekend"):
             v = None if v is None else bool(v)
         out[k] = v
     return out
+
+
+PROFILE_KEYS = ("sens", "min_agree", "entry_tf", "mode", "rr_intraday", "rr_scalp", "sl_buffer", "gate_sweep", "gate_killzone",
+                "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
+
+
+def clean_profiles(v) -> Dict:
+    """{SYMBOL: {settings}} — each profile is validated with the same rules as the global settings."""
+    if not isinstance(v, dict):
+        raise ValueError("profiles must be an object")
+    out: Dict = {}
+    for sym, prof in v.items():
+        sym = str(sym).upper()
+        if not sym.isalnum() or len(sym) > 20 or prof is None:
+            continue
+        if not isinstance(prof, dict):
+            raise ValueError("a profile must be an object")
+        sub = clean({k: x for k, x in prof.items() if k in PROFILE_KEYS})
+        sub = {k: x for k, x in sub.items() if x is not None}
+        if sub:
+            sub["tuned_at"] = int(prof.get("tuned_at") or 0) or None
+            if prof.get("score") is not None:
+                sub["score"] = prof["score"]
+            out[sym] = {k: x for k, x in sub.items() if x is not None}
+    return out
+
+
+def profile_for(symbol: str, cfg: Dict = None) -> Dict:
+    cfg = cfg or get()
+    return dict((cfg.get("profiles") or {}).get(symbol.upper()) or {})
+
+
+def set_profile(symbol: str, prof: Dict) -> Dict:
+    cur = get()
+    profiles = dict(cur.get("profiles") or {})
+    if prof:
+        profiles[symbol.upper()] = prof
+    else:
+        profiles.pop(symbol.upper(), None)
+    return set_({"profiles": profiles})
 
 
 def set_(patch: Dict) -> Dict:
@@ -96,4 +149,6 @@ def set_(patch: Dict) -> Dict:
 
 
 def custom_opts(cfg: Dict) -> Dict:
-    return {k: cfg[k] for k in ("rr_intraday", "rr_scalp", "sl_buffer", "gate_sweep", "gate_killzone") if cfg.get(k) is not None}
+    keys = ("rr_intraday", "rr_scalp", "sl_buffer", "gate_sweep", "gate_killzone", "risk_guard", "max_chase_atr",
+            "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
+    return {k: cfg[k] for k in keys if cfg.get(k) is not None}

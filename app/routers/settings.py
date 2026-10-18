@@ -1,4 +1,5 @@
 import asyncio
+import time
 
 import aiohttp
 from fastapi import APIRouter, Body, Depends, HTTPException
@@ -47,3 +48,18 @@ async def update_engine(payload: dict = Body(...), user=Depends(get_current_user
     except (ValueError, TypeError) as e:
         raise HTTPException(400, str(e))
     return {"ok": True, "config": cfg}
+
+
+@router.put("/engine/profile/{symbol}")
+async def save_engine_profile(symbol: str, payload: dict = Body(...), user=Depends(get_current_user)):
+    """Store the tuned settings for ONE pair (the backtest optimizer's result). They then apply to that pair's
+    chart, scanner rows, entry-timeframe scan and Telegram alerts. An empty body clears the profile."""
+    sym = symbol.upper()
+    if not sym.isalnum() or len(sym) > 20:
+        raise HTTPException(400, "bad symbol")
+    try:
+        prof = engine_config.clean_profiles({sym: {**payload, "tuned_at": int(time.time())}}).get(sym, {}) if payload else {}
+        cfg = await asyncio.to_thread(engine_config.set_profile, sym, prof)
+    except (ValueError, TypeError) as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "profile": engine_config.profile_for(sym, cfg), "config": cfg}

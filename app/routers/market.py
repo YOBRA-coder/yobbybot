@@ -110,7 +110,7 @@ def _check_mode(mode: str, entry_tf: str, min_agree: float):
 
 @router.get("/mtf/{symbol}")
 async def get_mtf(symbol: str, mode: str = "combined", entry_tf: str = "15m", min_agree: float = mtf.DEFAULT_MIN_AGREE, tfs: str = "", bars: int = 300,
-                  sens: str = "balanced", consensus: bool = False, weighting: str = "equal"):
+                  sens: str = "balanced", consensus: bool = False, weighting: str = "equal", profile: bool = True):
     """The top-down read for one pair: bias (4H) -> setup (1H) -> trigger (entry TF), plus one chart
     panel per timeframe in `tfs` (default 4h,1h,<entry_tf>) holding the candles and every SMC concept
     detected on that timeframe — order blocks, FVGs, supply/demand, POI, BOS/CHoCH, HH/HL/LH/LL swings,
@@ -134,7 +134,8 @@ async def get_mtf(symbol: str, mode: str = "combined", entry_tf: str = "15m", mi
                      f"Check GET /market/store, or start the backend with CRYPTO_DEMO=1 to test the UI offline.",
         }
     now_ms = time.time() * 1000
-    opts = mtf.opts_for(sens, engine_config.custom_opts(engine_config.get()))
+    sens, min_agree, custom, prof = scanner.apply_profile(symbol, sens, min_agree, engine_config.custom_opts(engine_config.get()), profile)
+    opts = mtf.opts_for(sens, custom)
 
     def run_engine():
         res = mtf.evaluate_all(frames, mode, entry_tf, min_agree, now_ms, None, opts)
@@ -168,7 +169,7 @@ async def get_mtf(symbol: str, mode: str = "combined", entry_tf: str = "15m", mi
         "price": tick.get("price") or ec[-1]["close"], "changePct": tick.get("changePct"),
         "staleMinutes": round(lag_min, 1),
         "decision": result["decision"], "styles": result["styles"], "panels": panels, "vote": vote,
-        "counter": result.get("counter"),
+        "counter": result.get("counter"), "profile": prof,
         "sens": sens, "consensus": consensus,
         "styleInfo": {k: {"bias_tf": v["bias_tf"], "setup_tf": v["setup_tf"], "entry_tfs": list(v["entry_tfs"]),
                            "label": v["label"]} for k, v in mtf.STYLES.items()},
@@ -177,23 +178,23 @@ async def get_mtf(symbol: str, mode: str = "combined", entry_tf: str = "15m", mi
 
 @router.get("/overview")
 async def get_overview(mode: str = "combined", entry_tf: str = "15m", min_agree: float = mtf.DEFAULT_MIN_AGREE,
-                       sens: str = "balanced", consensus: bool = False, weighting: str = "equal"):
+                       sens: str = "balanced", consensus: bool = False, weighting: str = "equal", profile: bool = True):
     """One row per pair: bias, setup state (SIGNAL / SETUP / WATCH / STAND_ASIDE), agreement, what to wait for.
     Cached ~45 s; the background scanner keeps the default settings warm."""
     _check_mode(mode, entry_tf, min_agree)
     _check_engine(sens, weighting)
-    ov = await scanner.overview(mode, entry_tf, min_agree, 45, sens, consensus, weighting)
+    ov = await scanner.overview(mode, entry_tf, min_agree, 45, sens, consensus, weighting, profile)
     return {"rows": ov["rows"], "updated": int(ov["ts"]), "demo": DEMO_MODE and not live_tickers}
 
 
 @router.get("/entry-scan/{symbol}")
 async def entry_scan(symbol: str, mode: str = "combined", min_agree: float = mtf.DEFAULT_MIN_AGREE, sens: str = "balanced",
-                     consensus: bool = False, weighting: str = "equal"):
+                     consensus: bool = False, weighting: str = "equal", profile: bool = True):
     """Which entry timeframe (1m…30m) is ready right now for this pair — 'find one faster'."""
     symbol = _check_symbol(symbol)
     _check_mode(mode, "15m", min_agree)
     _check_engine(sens, weighting)
-    return await scanner.entry_scan(symbol, mode, min_agree, sens, consensus, weighting)
+    return await scanner.entry_scan(symbol, mode, min_agree, sens, consensus, weighting, use_profile=profile)
 
 
 @router.get("/engine")
@@ -227,13 +228,56 @@ async def get_news(symbol: str = "", limit: int = 30):
     return await news.get_news(symbol.upper(), min(max(limit, 1), 60))
 
 
+@router.get("/mtf/optimize/{symbol}")
+async def mtf_optimize(symbol: str, style: str = "intraday", entry_tf: str = "15m", bars: int = 3000,
+                       fee_pct: float = 0.1, slippage_pct: float = 0.0):
+    """Search the best engine settings for ONE pair on its stored history. The history is split: settings are
+    chosen on the first ~65% and re-tested on the untouched last ~35%; only settings positive on both are
+    recommended. Heavy (tens of seconds) — runs in a thread. Apply the result with PUT /settings/engine/profile/{symbol}."""
+    from ..services import optimizer
+    symbol = _check_symbol(symbol)
+    if style not in mtf.STYLES:
+        raise HTTPException(400, f"style must be one of: {', '.join(mtf.STYLES)}")
+    _check_mode(style, entry_tf, mtf.DEFAULT_MIN_AGREE)
+    if not (0 <= fee_pct <= 1 and 0 <= slippage_pct <= 1):
+        raise HTTPException(400, "fee_pct/slippage_pct must be 0-1")
+    bars = min(max(bars, 800), 8000)
+    et = mtf._entry_for(style, entry_tf)
+    frames = await _bt_frames(symbol, style, et, bars)
+    custom = engine_config.custom_opts(engine_config.get())
+    try:
+        res = await asyncio.to_thread(optimizer.optimize, frames, style, et, fee_pct, slippage_pct, custom)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    res["symbol"] = symbol
+    res["demo"] = DEMO_MODE and not live_tickers
+    return res
+
+
+async def _bt_frames(symbol: str, style: str, et: str, bars: int) -> Dict[str, List[dict]]:
+    cfg = mtf.STYLES[style]
+    span_ms = bars * mtf.TF_MS[et]
+    counts = {
+        et: bars,
+        cfg["setup_tf"]: int(span_ms / mtf.TF_MS[cfg["setup_tf"]]) + 320,
+        cfg["bias_tf"]: int(span_ms / mtf.TF_MS[cfg["bias_tf"]]) + 320,
+    }
+    async with aiohttp.ClientSession() as s:
+        got = await asyncio.gather(*(fetch_history(s, symbol, tf, min(n, 40000)) for tf, n in counts.items()))
+    frames = dict(zip(counts.keys(), got))
+    if any(len(v) < 100 for v in frames.values()):
+        raise HTTPException(503, "Not enough history available (exchange unreachable and the candle store is thin)")
+    return frames
+
+
 @router.get("/mtf/backtest/{symbol}")
 async def mtf_backtest(symbol: str, style: str = "intraday", entry_tf: str = "15m", bars: int = 1500,
                        min_agree: float = mtf.DEFAULT_MIN_AGREE, long_only: bool = False,
                        sens: str = "balanced", rr: float = 0, sl_buffer: float = -1, fee_pct: float = 0.1,
                        slippage_pct: float = 0.0, min_grade: str = "D", breakeven_at_r: float = 0.0,
                        max_hold_bars: int = 300, killzone_only: bool = False, gate_sweep: bool = False,
-                       consensus: bool = False):
+                       consensus: bool = False, risk_guard: int = -1, max_chase_atr: float = 0, min_room_rr: float = 0,
+                       max_risk_pct: float = 0):
     """Replay the top-down engine on history (no look-ahead; fees + slippage included). Heavy: runs in a thread.
     Advanced knobs: rr (target in R, 0 = style default), sl_buffer (x ATR, -1 = default), min_grade, breakeven_at_r
     (move stop to entry after +N R), killzone_only, gate_sweep (require a liquidity sweep), consensus (the entry-TF
@@ -268,6 +312,14 @@ async def mtf_backtest(symbol: str, style: str = "intraday", entry_tf: str = "15
         custom["sl_buffer"] = min(sl_buffer, 2.0)
     if gate_sweep:
         custom["gate_sweep"] = True
+    if 0 <= risk_guard <= 2:
+        custom["risk_guard"] = risk_guard
+    if 0.3 <= max_chase_atr <= 4:
+        custom["max_chase_atr"] = max_chase_atr
+    if 0.8 <= min_room_rr <= 4:
+        custom["min_room_rr"] = min_room_rr
+    if 0.3 <= max_risk_pct <= 10:
+        custom["max_risk_pct"] = max_risk_pct
     opts = mtf.opts_for(sens, custom)
     vfn = votes.quick_agrees if consensus else None
     res = await asyncio.to_thread(
@@ -278,7 +330,8 @@ async def mtf_backtest(symbol: str, style: str = "intraday", entry_tf: str = "15
     res["params"] = {"style": style, "sens": sens, "min_agree": min_agree, "rr": opts.get(f"rr_{style}") or cfg["rr"],
                      "sl_buffer": opts.get("sl_buffer", 0.25), "fee_pct": fee_pct, "slippage_pct": slippage_pct,
                      "min_grade": min_grade, "breakeven_at_r": breakeven_at_r, "killzone_only": killzone_only,
-                     "gate_sweep": bool(opts.get("gate_sweep")), "consensus": consensus, "long_only": long_only}
+                     "gate_sweep": bool(opts.get("gate_sweep")), "consensus": consensus, "long_only": long_only,
+                     "risk_guard": opts.get("risk_guard", 0)}
     return res
 
 

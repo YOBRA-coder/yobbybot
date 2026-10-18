@@ -259,6 +259,57 @@ def test_evaluate_all_returns_counter_watch():
         json.dumps(out["counter"])
 
 
+def test_entry_risk_guard_holds_back_chasing_entries():
+    cb, cs = _long_setup()
+    free = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")                      # guard off: still rated
+    assert free["state"] == "SIGNAL" and free["entry_risk"]["level"] == "HIGH" and free["entry_risk"]["reasons"]
+    for g in (1, 2):
+        r = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m", opts={"risk_guard": g})
+        assert r["type"] == "HOLD" and r["state"] == "SETUP" and "risky" in r["watch"]
+        assert next(c for c in r["checks"] if c["id"] == "risk")["ok"] is False
+    # presets carry the guard: strict blocks medium+high, fast only rates
+    assert mtf.opts_for("strict")["risk_guard"] == 2 and mtf.opts_for("fast")["risk_guard"] == 0
+    assert mtf.opts_for("balanced", {"risk_guard": 2})["risk_guard"] == 2
+
+
+def test_engine_profiles_roundtrip_and_validation():
+    from app.services import engine_config as ec
+    ec.set_profile("btcusdt", {"sens": "strict", "min_agree": 82, "rr_intraday": 2.5, "risk_guard": 2, "score": 1.4, "tuned_at": 123})
+    p = ec.profile_for("BTCUSDT")
+    assert p["sens"] == "strict" and p["min_agree"] == 82 and p["risk_guard"] == 2 and p["score"] == 1.4
+    try:
+        ec.set_profile("ETHUSDT", {"sens": "wild"})
+        assert False
+    except ValueError:
+        pass
+    ec.set_profile("BTCUSDT", {})
+    assert ec.profile_for("BTCUSDT") == {}
+
+
+def test_optimizer_is_honest_and_apply_profile_overrides():
+    from app.services import optimizer, engine_config as ec
+    fr = _frames("ETHUSDT", 1000)
+    o = optimizer.optimize(fr, "intraday", "15m")
+    assert o["verdict"] in ("robust", "tentative", "none") and o["runs"] >= 30 and o["candidates"] is not None
+    assert o["split_time"] > o["from"] and o["split_time"] < o["to"]
+    if o["verdict"] == "none":
+        assert o["profile"] is None and "no" in o["note"].lower()
+    else:       # a recommendation must be positive on BOTH the search and the untouched period
+        assert o["best"]["train"]["avg_r"] > 0 and o["best"]["val"]["avg_r"] > 0
+    json.dumps(o)
+    try:
+        optimizer.optimize({k: v[:100] for k, v in fr.items()}, "intraday", "15m")
+        assert False
+    except ValueError:
+        pass
+    ec.set_profile("ETHUSDT", {"sens": "strict", "min_agree": 83, "risk_guard": 2, "rr_intraday": 3.0})
+    sens, ma, custom, prof = scanner.apply_profile("ETHUSDT", "fast", 60, {"sl_buffer": 0.3}, True)
+    assert (sens, ma) == ("strict", 83) and custom["risk_guard"] == 2 and custom["rr_intraday"] == 3.0 and custom["sl_buffer"] == 0.3
+    assert scanner.apply_profile("ETHUSDT", "fast", 60, None, False)[:2] == ("fast", 60)       # toggle off: untouched
+    assert scanner.apply_profile("BTCUSDT", "fast", 60, None, True)[3] is None                    # other pairs: untouched
+    ec.set_profile("ETHUSDT", {})
+
+
 def test_styles_and_entry_tf_selection():
     assert mtf.needed_timeframes("intraday", "15m") == ["4h", "1h", "15m"]
     assert mtf.needed_timeframes("scalp", "1m") == ["1h", "15m", "1m"]
