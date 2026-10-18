@@ -72,6 +72,78 @@ def opts_for(sens: str = "balanced", custom: Optional[Dict] = None) -> Dict:
     return o
 
 
+def next_killzone(ts_s: float) -> Optional[Dict]:
+    """The London / New York window that is active now or opens next (UTC), as {name, start, active}."""
+    t0 = int(ts_s // 900 * 900)
+    cur = killzone(t0)
+    for i in range(0, 96 * 4):
+        t = t0 + i * 900
+        kz = killzone(t)
+        if kz and (i == 0 or killzone(t - 900) != kz):
+            return {"name": kz, "start": t if i else int(ts_s), "active": i == 0}
+    return None
+
+
+def _bars_window(dist: float, atr: float, bar_s: float, t0: float) -> Tuple[float, float, int, int]:
+    """Rough clock window for price to travel `dist`: fast end = a steady push (dist/ATR bars), slow end =
+    random-walk pace ((dist/ATR)^2 bars). A guide, not a promise."""
+    k = max(dist / atr, 0.5) if atr > 0 else 1.0
+    lo, hi = max(1, math.ceil(k)), max(2, min(400, math.ceil(k * k)))
+    hi = max(hi, lo + 1)
+    return t0 + lo * bar_s, t0 + hi * bar_s, lo, hi
+
+
+def _outlook(kind: str, state: str, side: str, d: str, ET: str, ST: str, BT: str, last_t: int, emsg: int, stf: str,
+             now_ms: Optional[float], atr_e: float, price: float, trig_bars: int, plan: Optional[Dict],
+             zone: Optional[Dict], expect: Optional[Dict], fired: bool, watch: str) -> Dict:
+    """What to expect and roughly WHEN — for a with-trend read or a counter-trend read."""
+    bar_s = emsg / 1000
+    now_s = now_ms / 1000 if now_ms else last_t + 2 * bar_s
+    next_close = last_t + 2 * bar_s                      # the forming entry bar closes here
+    while next_close < now_s - bar_s:                    # demo / stale data: stay near "now"
+        next_close += bar_s
+    kz = next_killzone(max(now_s, next_close))
+    tag = "COUNTER-TREND " if kind == "counter" else ""
+    o: Dict = {"kind": kind, "side": side, "state": state, "scenario": watch, "confirm": None, "invalid": None,
+               "target": None, "from": None, "to": None, "window": "", "killzone": kz, "risk_note": None}
+    if kind == "counter":
+        o["risk_note"] = (f"Against the {BT} trend — a reversal try, not the main trend. Smaller size, take partial profit "
+                          f"at 1R, and expect a quick fail if {ST} does not hold the turn.")
+    zbot, ztop = (zone["bottom"], zone["top"]) if zone else (None, None)
+    if state == "SIGNAL" and plan:
+        dist = abs(plan["tp"] - plan["entry"])
+        lo_t, hi_t, lo, hi = _bars_window(dist, atr_e, bar_s, next_close - bar_s)
+        o.update(scenario=f"{tag}{side} is live: entry {_fmt(plan['entry'])}, stop {_fmt(plan['sl'])}, target {_fmt(plan['tp'])} ({plan['rr']}R).",
+                 confirm=f"Already confirmed on the closed {ET} candle.", invalid=plan["sl"], target=plan["tp"],
+                 **{"from": int(lo_t), "to": int(hi_t)},
+                 window=f"Target is usually reached in ~{lo}–{hi} {ET} bars; the idea is stale if it is not working after ~{hi} bars.")
+    elif state == "SETUP" and zone:
+        to = next_close + max(1, trig_bars) * bar_s
+        inv = zbot if d == "bullish" else ztop
+        o.update(scenario=f"{tag}price is at the {zone['tf'].upper()} {zone['src']} {_fmt(zbot)}–{_fmt(ztop)}: expect a {ET} confirmation candle, then a {side}.",
+                 confirm=f"A {d} engulfing / rejection / displacement candle closing on {ET} while price holds the zone.",
+                 invalid=inv, target=plan["tp"] if plan else None, **{"from": int(next_close), "to": int(to)},
+                 window=f"Confirmation is due within the next {trig_bars} {ET} bars (first possible close shown); otherwise the setup ages out.")
+    elif state == "WATCH" and expect:
+        dist = abs(price - (expect["top"] if d == "bullish" else expect["bottom"]))
+        lo_t, hi_t, lo, hi = _bars_window(dist, atr_e, bar_s, next_close - bar_s)
+        inv = expect["bottom"] if d == "bullish" else expect["top"]
+        o.update(scenario=f"{tag}expect a {side} only if price {'pulls back down' if d == 'bullish' else 'rallies back up'} into the "
+                          f"{expect['tf'].upper()} {expect['src']} {_fmt(expect['bottom'])}–{_fmt(expect['top'])} "
+                          f"({expect['distance_pct']:.2f}% away).",
+                 confirm=f"Then a {d} confirmation candle on {ET}.", invalid=inv,
+                 **{"from": int(lo_t), "to": int(hi_t + trig_bars * bar_s)},
+                 window=f"Price could reach the zone in ~{lo}–{hi} {ET} bars; the trigger comes after that."
+                        + (f" Next liquid window: {kz['name']} {'now' if kz['active'] else 'opens soon'}." if kz else ""))
+    else:
+        stf_s = TF_MS.get(stf, 3_600_000) / 1000
+        nxt = (now_s // stf_s + 1) * stf_s
+        o.update(scenario=watch, confirm=(f"A {d} CHoCH/BOS on {ST}, then a zone touch and a {ET} trigger." if kind == "counter"
+                                          else f"Nothing to do until the {ST} structure lines up."),
+                 **{"from": int(nxt), "to": int(nxt)}, window=f"Re-check at the next {ST} close.")
+    return o
+
+
 MIN_RISK_PCT = 0.0015      # stops tighter than 0.15% are eaten by fees
 MAX_RISK_PCT = 0.06
 
@@ -217,7 +289,7 @@ def _empty_result(style: str, entry_tf: str, reason: str) -> Dict:
         "type": "HOLD", "state": "STAND_ASIDE", "direction": "neutral", "confidence": 0, "grade": "D",
         "agreement": 0, "gates_ok": False, "checks": [], "plan": None, "zone": None, "watch": reason,
         "reason": reason, "steps": [smc._step("DATA", "wait", reason, "data")],
-        "targetPrice": None, "stopLoss": None,
+        "targetPrice": None, "stopLoss": None, "kind": "trend", "outlook": None,
     }
 
 
@@ -225,6 +297,7 @@ def _empty_result(style: str, entry_tf: str, reason: str) -> Dict:
 def evaluate_style(
     style: str, ctx_bias: Dict, ctx_setup: Dict, entry: List[dict], entry_tf: str,
     min_agree: float = DEFAULT_MIN_AGREE, now_ms: Optional[float] = None, opts: Optional[Dict] = None,
+    against: bool = False,
 ) -> Dict:
     """Evaluate ONE style on pre-computed bias/setup analyses (`smc.analyze_full`)
     and the entry-TF candles. If `now_ms` is given and the newest entry candle is
@@ -232,6 +305,9 @@ def evaluate_style(
     cfg = STYLES[style]
     opts = opts or {}
     rr_use = float(opts.get(f"rr_{style}") or cfg["rr"])
+    if against:
+        rr_use = min(rr_use, 1.5)                # counter-trend targets stay closer
+        min_agree = min(100.0, float(min_agree) + 5)   # and it has to be a little cleaner
     sl_buf = float(opts.get("sl_buffer") if opts.get("sl_buffer") is not None else 0.25)
     trig_bars = int(opts.get("trigger_bars") or cfg["trigger_bars"])
     btf, stf = cfg["bias_tf"], cfg["setup_tf"]
@@ -247,22 +323,32 @@ def evaluate_style(
     atr_s = ctx_setup.get("atr") or atr_e * 3
     bias = ctx_bias.get("bias") or smc.bias_state(ctx_bias)
     setup_b = ctx_setup.get("bias") or smc.bias_state(ctx_setup)
-    d = bias["bias"]
+    htf_d = bias["bias"]
+    d = htf_d
+    if against and htf_d != "neutral":
+        d = "bearish" if htf_d == "bullish" else "bullish"      # counter-trend: fade the higher-timeframe bias
+    kind = "counter" if against else "trend"
     checks: List[Dict] = []
     BT, ST, ET = btf.upper(), stf.upper(), entry_tf.upper()
 
     # STEP 1 — direction ----------------------------------------------------
     lb = bias.get("last_break")
-    detail = (f"{BT} {d}: last {lb['kind']} {lb['dir']} through {_fmt(lb['level'])}; swings {bias['swing_trend']}"
+    detail = (f"{BT} {htf_d}: last {lb['kind']} {lb['dir']} through {_fmt(lb['level'])}; swings {bias['swing_trend']}"
               if lb else f"{BT} has no confirmed BOS/CHoCH yet")
-    checks.append(_check("bias", 1, f"{BT} structure bias", d != "neutral", 25, detail, gate=True))
+    if against and htf_d != "neutral":
+        detail += f" — counter-trade fades it ({d})"
+    checks.append(_check("bias", 1, f"{BT} structure bias" + (" (faded)" if against else ""), htf_d != "neutral", 25, detail, gate=True))
 
     if d == "neutral":
-        res = _empty_result(style, entry_tf, f"{BT} bias is neutral (structure and swings disagree) — stand aside")
+        res = _empty_result(style, entry_tf, f"{BT} bias is neutral (structure and swings disagree) — " +
+                            ("no trend to fade" if against else "stand aside"))
+        res["kind"] = kind
         res["checks"] = checks + [_check("rest", 2, "Remaining checks", None, 0, "skipped — no direction")]
         res["bias"] = {"bias": d, "bias_tf": btf, "setup_tf": stf}
         res["steps"] = [smc._step("STRUCTURE", "block", f"{BT} bias neutral — no trade", "bias-neutral")]
         res["agreement"] = 0
+        res["outlook"] = _outlook(kind, "STAND_ASIDE", "", d, ET, ST, BT, last_t, emsg, stf, now_ms, atr_e, price,
+                                  trig_bars, None, None, None, False, res["watch"])
         return res
 
     sign = 1 if d == "bullish" else -1
@@ -278,9 +364,12 @@ def evaluate_style(
         checks.append(_check("pd", 1, f"{BT} premium / discount", None, 8, "range not available"))
 
     # STEP 3 — setup-TF agreement + zone ------------------------------------
-    agree_ok = setup_b["bias"] == d or setup_b["swing_trend"] == d
-    checks.append(_check("align", 3, f"{ST} structure agrees with {BT}", agree_ok, 15,
-                         f"{ST} bias {setup_b['bias']} (breaks {setup_b['break_trend']}, swings {setup_b['swing_trend']}) vs {BT} {d}",
+    if against:
+        agree_ok = setup_b["bias"] == d          # the setup TF must already have turned against the bias
+    else:
+        agree_ok = setup_b["bias"] == d or setup_b["swing_trend"] == d
+    checks.append(_check("align", 3, f"{ST} structure has turned {d}" if against else f"{ST} structure agrees with {BT}", agree_ok, 15,
+                         f"{ST} bias {setup_b['bias']} (breaks {setup_b['break_trend']}, swings {setup_b['swing_trend']}) vs {BT} {htf_d}",
                          gate=True))
 
     zones = _aligned_zones(ctx_setup, stf, d) + _aligned_zones(ctx_bias, btf, d)
@@ -460,7 +549,14 @@ def evaluate_style(
             watch = f"{BT}/{ST} are {d} but there is no fresh {'demand' if d == 'bullish' else 'supply'} zone on the path — wait for new structure"
     else:
         state = "STAND_ASIDE"
-        watch = f"{ST} structure disagrees with {BT} {d} — stand aside until they align"
+        if against:
+            watch = (f"No counter-trade yet: {ST} is still {setup_b['bias']} with the {BT} {htf_d} trend. "
+                     f"It turns into a counter watch once {ST} prints a {d} CHoCH/BOS")
+        else:
+            watch = f"{ST} structure disagrees with {BT} {d} — stand aside until they align"
+
+    outlook = _outlook(kind, state, side, d, ET, ST, BT, last_t, emsg, stf, now_ms, atr_e, price, trig_bars,
+                       plan, best, expect, fired, watch)
 
     # trace for the bot log (same shape as smc.evaluate_entry's steps) -------
     def st(cid):
@@ -494,8 +590,8 @@ def evaluate_style(
         "reason": f"{cfg['label']} {side}: {trig} at {best['tf'].upper()} {best['src']} (agreement {agree}%)" if fired else watch,
         "steps": steps,
         "targetPrice": plan["tp"] if fired else None, "stopLoss": plan["sl"] if fired else None,
-        "bias": {"bias": d, "bias_tf": btf, "setup_tf": stf, "last_break": lb},
-        "time": last_t,
+        "bias": {"bias": htf_d, "bias_tf": btf, "setup_tf": stf, "last_break": lb},
+        "time": last_t, "kind": kind, "outlook": outlook,
     }
 
 
@@ -528,7 +624,11 @@ def evaluate_all(
         results[name] = evaluate_style(name, ctx(st["bias_tf"]), ctx(st["setup_tf"]), frames.get(et) or [], et,
                                        min_agree, now_ms, opts)
     best = max(results.values(), key=lambda r: (_STATE_RANK[r["state"]], r["agreement"]))
-    return {"decision": best, "styles": results, "analysis": ctxs}
+    # counter-trend watch for the chosen style: same engine, faded bias (watch-only, never auto-recorded)
+    cs = STYLES[best["style"]]
+    counter = evaluate_style(best["style"], ctx(cs["bias_tf"]), ctx(cs["setup_tf"]), frames.get(best["entry_tf"]) or [],
+                             best["entry_tf"], min_agree, now_ms, opts, against=True)
+    return {"decision": best, "styles": results, "analysis": ctxs, "counter": counter}
 
 
 # ── payloads for the chart ──────────────────────────────────────────────────

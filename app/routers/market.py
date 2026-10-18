@@ -168,6 +168,7 @@ async def get_mtf(symbol: str, mode: str = "combined", entry_tf: str = "15m", mi
         "price": tick.get("price") or ec[-1]["close"], "changePct": tick.get("changePct"),
         "staleMinutes": round(lag_min, 1),
         "decision": result["decision"], "styles": result["styles"], "panels": panels, "vote": vote,
+        "counter": result.get("counter"),
         "sens": sens, "consensus": consensus,
         "styleInfo": {k: {"bias_tf": v["bias_tf"], "setup_tf": v["setup_tf"], "entry_tfs": list(v["entry_tfs"]),
                            "label": v["label"]} for k, v in mtf.STYLES.items()},

@@ -80,6 +80,9 @@ def _row(symbol: str, result: Dict, frames: Dict[str, List[dict]], entry_tf: str
         "demo": DEMO_MODE and not tick,
         "vote": {"score": vt["score"], "direction": vt["direction"]} if vt else None,
         "vote_blocked": bool(dec.get("vote_blocked")),
+        "outlook": dec.get("outlook"),
+        "counter": ({"state": c["state"], "agreement": c["agreement"], "direction": c["direction"], "watch": c["watch"],
+                     "outlook": c.get("outlook")} if (c := result.get("counter")) and c.get("state") != "STAND_ASIDE" else None),
     }
 
 

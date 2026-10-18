@@ -219,6 +219,46 @@ def test_short_is_the_mirror_image():
     assert p["tp"] < p["entry"] < p["sl"]
 
 
+def _short_entry():
+    ent = []
+    for i in range(50):
+        p = 96.0 + (0.1 if i % 2 else -0.1)
+        ent.append(candle(i, p, p + 0.25, p - 0.25, p + (0.05 if i % 2 else -0.05), 100.0))
+    ent.append(candle(50, 96.0, 97.4, 95.9, 97.2, 100.0))
+    ent.append(candle(51, 97.2, 99.2, 97.1, 98.8, 100.0))
+    ent.append(candle(52, 98.9, 99.1, 97.0, 97.1, 300.0))
+    return ent
+
+
+def test_counter_trend_watch_and_outlook_timing():
+    # 4H still bullish, but the 1H has already turned bearish and price tapped a 1H supply zone
+    cb = _ctx("bullish", zones=[], atr=2.6, pd_pct=70)
+    cs = _ctx("bearish", zones=[("ob", 100.0, 99.0)], atr=1.3)
+    ent = _short_entry()
+    trend = mtf.evaluate_style("intraday", cb, cs, ent, "15m")
+    assert trend["type"] == "HOLD" and trend["kind"] == "trend"           # with-trend: 1H disagrees -> no trade
+    c = mtf.evaluate_style("intraday", cb, cs, ent, "15m", against=True)
+    assert c["kind"] == "counter" and c["direction"] == "bearish" and c["side"] == "SELL"
+    assert c["state"] in ("SIGNAL", "SETUP"), (c["state"], [(k["id"], k["ok"]) for k in c["checks"]])
+    assert c["plan"]["rr"] <= 1.5 and c["plan"]["tp"] < c["plan"]["entry"] < c["plan"]["sl"]
+    o = c["outlook"]
+    assert o["kind"] == "counter" and o["risk_note"] and o["to"] >= o["from"] > 0 and o["window"]
+    # with-trend read also carries what-to-expect + a time window
+    cb2, cs2 = _long_setup()
+    t2 = mtf.evaluate_style("intraday", cb2, cs2, _entry(), "15m")
+    assert t2["outlook"]["kind"] == "trend" and t2["outlook"]["to"] > t2["outlook"]["from"] > 0
+    # a neutral higher timeframe has no trend to fade
+    n = mtf.evaluate_style("intraday", _ctx("neutral", last_break=False), cs, ent, "15m", against=True)
+    assert n["state"] == "STAND_ASIDE" and "no trend to fade" in n["watch"]
+
+
+def test_evaluate_all_returns_counter_watch():
+    out = mtf.evaluate_all(_frames("BTCUSDT"), "intraday", "15m") if "_frames" in globals() else None
+    if out:
+        assert out["counter"]["kind"] == "counter" and out["decision"]["outlook"] is not None
+        json.dumps(out["counter"])
+
+
 def test_styles_and_entry_tf_selection():
     assert mtf.needed_timeframes("intraday", "15m") == ["4h", "1h", "15m"]
     assert mtf.needed_timeframes("scalp", "1m") == ["1h", "15m", "1m"]
