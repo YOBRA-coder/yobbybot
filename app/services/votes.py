@@ -1,9 +1,10 @@
 """
 Strategy vote — what OTHER classic strategies say about the same pair, next to the SMC engine.
 
-Six independent strategies each vote BUY (+1), SELL (-1) or NEUTRAL (0) on closed candles:
+Eight independent strategies each vote BUY (+1), SELL (-1) or NEUTRAL (0) on closed candles:
   EMA trend and SuperTrend (read on the setup timeframe), MACD momentum, RSI, Donchian breakout and
-  Bollinger reversion (read on the entry timeframe). SMC's own decision counts as a seventh vote.
+  Bollinger reversion, and anchored VWAP (read on the entry timeframe; Ichimoku on the setup timeframe).
+  SMC's own decision counts as a ninth vote.
 
 Each strategy also gets a short TRACK RECORD on the stored candles — every time it flipped to a new
 vote, what did price do over the next 12 bars (after 0.2% round-trip fees)? "Use the best" then
@@ -20,10 +21,12 @@ HORIZON = 12          # bars looked forward when scoring a vote
 LOOKBACK = 700        # bars of history used for the track record
 MIN_SAMPLES = 12
 FEE_PCT = 0.2         # round trip
-TF_ROLE = {"ema": "setup", "supertrend": "setup", "macd": "entry", "rsi": "entry", "breakout": "entry", "boll": "entry"}
+TF_ROLE = {"ema": "setup", "supertrend": "setup", "macd": "entry", "rsi": "entry", "breakout": "entry", "boll": "entry",
+           "vwap": "entry", "ichimoku": "setup"}
 NAMES = {
     "smc": "SMC top-down", "ema": "EMA trend (20/50/200)", "supertrend": "SuperTrend (10, 3)", "macd": "MACD momentum",
     "rsi": "RSI (14)", "breakout": "Donchian breakout (20)", "boll": "Bollinger reversion (20, 2)",
+    "vwap": "Daily-anchored VWAP", "ichimoku": "Ichimoku cloud (9, 26, 52)",
 }
 
 
@@ -157,8 +160,56 @@ def supertrend_series(cs: List[dict], n: int = 10, mult: float = 3.0) -> List[in
     return out
 
 
+def vwap_series(cs: List[dict]) -> List[int]:
+    """Volume-weighted average price anchored to the UTC day open. Price clearly above → +1, below → -1."""
+    out = [0] * len(cs)
+    day = None
+    pv = vv = 0.0
+    for i, c in enumerate(cs):
+        d = int(c["time"] // 1000 // 86400)
+        if d != day:
+            day, pv, vv = d, 0.0, 0.0
+        tp = (c["high"] + c["low"] + c["close"]) / 3
+        w = c.get("volume") or 0.0
+        pv, vv = pv + tp * w, vv + w
+        if vv <= 0 or i < 3:
+            continue
+        vw = pv / vv
+        band = 0.0005 * vw                      # 0.05% dead-zone so a price on the line is neutral
+        out[i] = 1 if c["close"] > vw + band else -1 if c["close"] < vw - band else 0
+    return out
+
+
+def ichimoku_series(cs: List[dict]) -> List[int]:
+    """Price above the (26-bar-shifted) cloud with tenkan over kijun → +1; mirrored → -1; inside the cloud → 0."""
+    n = len(cs)
+    out = [0] * n
+    if n < 80:
+        return out
+    hh = lambda a, b: max(x["high"] for x in cs[a:b])  # noqa: E731
+    ll = lambda a, b: min(x["low"] for x in cs[a:b])   # noqa: E731
+    ten = [None] * n
+    kij = [None] * n
+    spb = [None] * n
+    for i in range(51, n):
+        ten[i] = (hh(i - 8, i + 1) + ll(i - 8, i + 1)) / 2
+        kij[i] = (hh(i - 25, i + 1) + ll(i - 25, i + 1)) / 2
+        spb[i] = (hh(i - 51, i + 1) + ll(i - 51, i + 1)) / 2
+    for i in range(51 + 26, n):
+        j = i - 26                                # the cloud drawn at bar i was computed 26 bars ago
+        a = (ten[j] + kij[j]) / 2
+        b = spb[j]
+        top, bot = max(a, b), min(a, b)
+        p = cs[i]["close"]
+        if p > top and ten[i] > kij[i]:
+            out[i] = 1
+        elif p < bot and ten[i] < kij[i]:
+            out[i] = -1
+    return out
+
+
 SERIES = {"ema": ema_series, "macd": macd_series, "rsi": rsi_series, "breakout": breakout_series,
-          "boll": boll_series, "supertrend": supertrend_series}
+          "boll": boll_series, "supertrend": supertrend_series, "vwap": vwap_series, "ichimoku": ichimoku_series}
 
 
 def track_record(cs: List[dict], votes: List[int]) -> Dict:
@@ -191,6 +242,8 @@ def _detail(sid: str, v: float, tf: str) -> str:
         "rsi": f"RSI {side} on {t}",
         "breakout": f"20-bar channel: {side} on {t}",
         "boll": f"Bollinger band reversion: {side} on {t}",
+        "vwap": f"price vs daily VWAP on {t}: {side}",
+        "ichimoku": f"price vs Ichimoku cloud and tenkan/kijun on {t}: {side}",
     }[sid] if v else f"no clear {NAMES[sid].split(' (')[0]} signal on {t}"
 
 

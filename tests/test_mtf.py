@@ -559,8 +559,8 @@ def test_votes_and_consensus_gate():
     cs, su = demo_feed.klines("BTCUSDT", "15m", 600), demo_feed.klines("BTCUSDT", "1h", 600)
     dec = {"direction": "bullish", "state": "SIGNAL", "type": "BUY", "bias_tf": "4h", "watch": "w"}
     v = votes.compute({"15m": cs, "1h": su}, "15m", "1h", dec, mtf.TF_MS, None, "best")
-    assert [r["id"] for r in v["votes"]][0] == "smc" and len(v["votes"]) == 7
-    assert -100 <= v["score"] <= 100 and v["buy"] + v["sell"] + v["neutral"] == 7
+    assert [r["id"] for r in v["votes"]][0] == "smc" and len(v["votes"]) == 9
+    assert -100 <= v["score"] <= 100 and v["buy"] + v["sell"] + v["neutral"] == 9
     if v["best"]:
         assert next(r for r in v["votes"] if r["id"] == v["best"]["id"])["weight"] == 3.0
     # series are aligned with the candles and only ever -1/0/1
@@ -591,6 +591,110 @@ def test_engine_config_roundtrip_and_validation():
 def test_secret_key_is_not_the_public_default():
     from app import config
     assert config.SECRET_KEY and config.SECRET_KEY != "nexusai-super-secret-key-change-in-production" and len(config.SECRET_KEY) >= 32
+
+
+# ── AMD / key levels, OTE, breakers, VWAP, Ichimoku ─────────────────────────
+_D0 = 1700006400            # 2023-11-15 00:00 UTC
+
+
+def _amd_day(up=True, hours=10):
+    """Previous day, an Asia range 100-102, then a London raid of one side that closes back inside."""
+    cs = [{"time": (_D0 - 86400 + k * 900) * 1000, "open": 100, "high": 103, "low": 98, "close": 100.5, "volume": 1} for k in range(96)]
+    for k in range(28):
+        cs.append({"time": (_D0 + k * 900) * 1000, "open": 101, "high": 102, "low": 100, "close": 101, "volume": 1})
+    for k in range(28, int(hours * 4)):
+        cs.append({"time": (_D0 + k * 900) * 1000, "open": 100.5, "high": 101 if up else 103,
+                   "low": 99 if up else 100, "close": 100.8 if up else 101.2, "volume": 1})
+    return cs
+
+
+def test_amd_asia_low_raid_expects_up_and_high_raid_expects_down():
+    from app.services import concepts
+    r = concepts.key_levels(_amd_day(True))
+    assert r["swept"] == "low" and r["expected"] == "bullish" and r["phase"] == "DISTRIBUTION"
+    assert (r["asia"]["high"], r["asia"]["low"]) == (102, 100) and r["pdh"] == 103 and r["pdl"] == 98 and r["day_open"] == 101
+    r = concepts.key_levels(_amd_day(False))
+    assert r["swept"] == "high" and r["expected"] == "bearish"
+
+
+def test_amd_no_read_while_asia_forms_or_on_big_bars_or_when_price_holds_beyond():
+    from app.services import concepts
+    early = _amd_day(True)[:96 + 20]                          # 05:00 UTC, Asia still forming
+    r = concepts.key_levels(early)
+    assert r["expected"] is None and r["phase"] == "ACCUMULATION"
+    cs = _amd_day(True)
+    cs[-1] = {**cs[-1], "close": 98.5}                        # closed back BELOW the Asia low: breakdown, not Judas swing
+    r = concepts.key_levels(cs)
+    assert r["expected"] is None and r["phase"] == "BREAKOUT"
+    four_h = [{"time": (_D0 - 10 * 86400 + k * 14400) * 1000, "open": 100, "high": 101, "low": 99, "close": 100, "volume": 1} for k in range(70)]
+    assert concepts.key_levels(four_h)["asia"] is None
+
+
+def test_ote_zone_is_62_to_79_pct_of_the_last_leg():
+    from app.services import concepts
+    cs = [candle(i, 100, 101, 99, 100, 1) for i in range(5)]
+    sw = [{"time": 1, "price": 100.0, "kind": "low"}, {"time": 2, "price": 110.0, "kind": "high"}]
+    cs[-1] = candle(5, 103, 104, 102, 103, 1)                 # 70% retrace of a 10 leg
+    o = concepts.find_ote(cs, sw)
+    assert o["dir"] == "bullish" and abs(o["top"] - 103.8) < 1e-9 and abs(o["bottom"] - 102.1) < 1e-9 and o["inside"]
+    o = concepts.find_ote(cs, [{"time": 1, "price": 110.0, "kind": "high"}, {"time": 2, "price": 100.0, "kind": "low"}])
+    assert o["dir"] == "bearish" and abs(o["bottom"] - 106.2) < 1e-9 and abs(o["top"] - 107.9) < 1e-9 and not o["inside"]
+
+
+def test_breaker_is_a_failed_order_block_that_flips_side():
+    from app.services import concepts
+    cs = [candle(i, 100, 101, 99, 100, 1) for i in range(6)]
+    cs[3] = candle(3, 100, 100.5, 99, 99.5, 1)
+    cs[4] = candle(4, 99.5, 99.6, 96, 96.5, 1)                # closes below the bullish OB bottom (99) -> failed
+    cs[5] = candle(5, 96.5, 98.0, 96.2, 97.5, 1)
+    ob = {"top": 100.0, "bottom": 99.0, "kind": "bullish", "time": int(cs[2]["time"] / 1000), "formed_at": int(cs[2]["time"] / 1000),
+          "mitigated": True, "strength": 2.0}
+    b = concepts.find_breakers(cs, [ob])
+    assert len(b) == 1 and b[0]["kind"] == "bearish" and b[0]["src"] == "BRK"
+    cs.append(candle(6, 97.5, 101.5, 97.4, 101.2, 1))         # reclaimed above -> no longer a breaker
+    assert concepts.find_breakers(cs, [ob]) == []
+
+
+def test_amd_check_agrees_or_gates_and_breakers_become_zones():
+    cb, cs = _long_setup()
+    cs["amd"] = {"expected": "bullish", "weak": False, "text": "raid", "asia": {"high": 102, "low": 100, "complete": True},
+                 "low_wick": 99.0, "high_wick": 103.0}
+    r = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")
+    assert next(c for c in r["checks"] if c["id"] == "amd")["ok"] is True
+    cs["amd"]["expected"] = "bearish"
+    r = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m", opts={"gate_amd": True})
+    amd_c = next(c for c in r["checks"] if c["id"] == "amd")
+    assert amd_c["ok"] is False and amd_c["gate"] and r["type"] == "HOLD"
+    r = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")          # advisory only by default
+    assert next(c for c in r["checks"] if c["id"] == "amd")["gate"] is False
+    cs["amd"] = None
+    r = mtf.evaluate_style("intraday", cb, cs, _entry(), "15m")
+    assert next(c for c in r["checks"] if c["id"] == "amd")["ok"] is None
+    z = mtf._aligned_zones({"breakers": [{"top": 2, "bottom": 1, "kind": "bullish", "time": 5}]}, "1h", "bullish")
+    assert z and z[0]["src"] == "BRK"
+    lv = mtf._opposing_levels([("1h", {"amd": {"pdh": 120.0, "asia": {"high": 110.0, "low": 90}}})], "bullish", 100.0)
+    assert [n for _, n in lv] == ["Asia high", "prev-day high"]
+
+
+def test_vwap_and_ichimoku_votes():
+    from app.services import votes
+    up = [{"time": (_D0 + i * 900) * 1000, "open": 100 + i * 0.1, "high": 100.3 + i * 0.1, "low": 99.8 + i * 0.1,
+           "close": 100.2 + i * 0.1, "volume": 10} for i in range(90)]
+    assert votes.vwap_series(up)[-1] == 1
+    dn = [{**c, "open": 200 - (c["open"] - 100), "high": 200 - (c["low"] - 100), "low": 200 - (c["high"] - 100), "close": 200 - (c["close"] - 100)} for c in up]
+    assert votes.vwap_series(dn)[-1] == -1
+    trend_up = [{"time": i * 3600000, "open": 100 + i, "high": 101 + i, "low": 99.5 + i, "close": 100.8 + i, "volume": 1} for i in range(140)]
+    assert votes.ichimoku_series(trend_up)[-1] == 1
+    trend_dn = [{"time": i * 3600000, "open": 300 - i, "high": 300.5 - i, "low": 299 - i, "close": 299.2 - i, "volume": 1} for i in range(140)]
+    assert votes.ichimoku_series(trend_dn)[-1] == -1
+    assert votes.ichimoku_series(trend_up[:60]) == [0] * 60
+    assert {"vwap", "ichimoku"} <= set(votes.TF_ROLE) and {"vwap", "ichimoku"} <= set(votes.NAMES)
+
+
+def test_gate_amd_is_a_saved_engine_option():
+    from app.services import engine_config as ec
+    assert "gate_amd" in mtf.OPT_KEYS and mtf.opts_for("balanced", {"gate_amd": True})["gate_amd"] is True
+    assert ec.clean({"gate_amd": 1})["gate_amd"] is True
 
 
 if __name__ == "__main__":

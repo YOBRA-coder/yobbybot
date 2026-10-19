@@ -64,7 +64,7 @@ SENSITIVITY: Dict[str, Dict] = {
                  "label": "Fast · earlier, more signals: wider touch window, older triggers still count, 60% agreement"},
 }
 OPT_KEYS = ("gate_sweep", "gate_killzone", "trigger_bars", "touch_mult", "rr_intraday", "rr_scalp", "sl_buffer",
-            "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
+            "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend", "gate_amd")
 
 
 def opts_for(sens: str = "balanced", custom: Optional[Dict] = None) -> Dict:
@@ -267,6 +267,10 @@ def _aligned_zones(ctx: Dict, tf: str, direction: str) -> List[Dict]:
         if not g["filled"] and g["kind"] == direction:
             out.append({"src": "FVG", "tf": tf, "top": g["top"], "bottom": g["bottom"], "time": g["time"],
                         "formed_at": g["time"], "fresh": g["fill_pct"] < 50, "strength": 1.0})
+    for k in ctx.get("breakers", []):
+        if k["kind"] == direction:
+            out.append({"src": "BRK", "tf": tf, "top": k["top"], "bottom": k["bottom"], "time": k["time"],
+                        "formed_at": k.get("formed_at", k["time"]), "fresh": True, "strength": k.get("strength", 1.0)})
     for z in ctx.get("sd_zones", []):
         if _zone_dir(z["kind"]) == direction and z["touches"] <= 1:
             out.append({"src": "S/D", "tf": tf, "top": z["top"], "bottom": z["bottom"], "time": z["time"],
@@ -319,6 +323,16 @@ def _opposing_levels(ctxs: List[Tuple[str, Dict]], direction: str, price: float)
                 out.append((e["price"], f"{tf} equal highs"))
             if direction == "bearish" and e["kind"] == "EQL":
                 out.append((e["price"], f"{tf} equal lows"))
+        am = ctx.get("amd") or {}
+        if am:   # previous day / week extremes and the Asia range are where resting orders sit
+            hi_names = (("pdh", "prev-day high"), ("pwh", "prev-week high"))
+            lo_names = (("pdl", "prev-day low"), ("pwl", "prev-week low"))
+            for key, nm in (hi_names if direction == "bullish" else lo_names):
+                if am.get(key) is not None:
+                    out.append((am[key], f"{nm}"))
+            a = am.get("asia")
+            if a:
+                out.append((a["high"], "Asia high") if direction == "bullish" else (a["low"], "Asia low"))
         for s in ctx.get("structure", {}).get("swings", []):
             if direction == "bullish" and s["kind"] == "high":
                 out.append((s["price"], f"{tf} swing high"))
@@ -498,9 +512,31 @@ def evaluate_style(
         eqs = [e for e in ctx_setup.get("eq", []) if e["kind"] == want and e["swept"]]
         if eqs:
             recent_sweep, src = {"wick": None, "level": eqs[0]["price"]}, f"{ST} {want} already swept"
+    amd = ctx_setup.get("amd") or None
+    if recent_sweep is None and amd and amd.get("expected") == d and amd.get("asia"):
+        # the Asia-range raid is liquidity taken too — its wick anchors the stop
+        lvl = amd["asia"]["low"] if d == "bullish" else amd["asia"]["high"]
+        wick = amd.get("low_wick") if d == "bullish" else amd.get("high_wick")
+        recent_sweep, src = {"wick": wick, "level": lvl}, f"Asia {'low' if d == 'bullish' else 'high'} {_fmt(lvl)} raided (AMD manipulation)"
     checks.append(_check("sweep", 3, "Liquidity swept before the entry", recent_sweep is not None, 10,
                          src or f"no {'sell' if d == 'bullish' else 'buy'}-side liquidity sweep nearby",
                          gate=bool(opts.get("gate_sweep"))))
+
+    # AMD / session read and OTE ------------------------------------------------
+    if amd and amd.get("expected") and not amd.get("weak"):
+        agree_amd = amd["expected"] == d
+        checks.append(_check("amd", 3, "AMD session read agrees (Asia raid → distribution)", agree_amd, 6,
+                             amd.get("text", ""), gate=bool(opts.get("gate_amd")) and not agree_amd))
+    else:
+        checks.append(_check("amd", 3, "AMD session read agrees (Asia raid → distribution)", None, 6,
+                             (amd or {}).get("text") or "no AMD read for this timeframe / time of day"))
+    ote = ctx_setup.get("ote")
+    if ote and ote["dir"] == d:
+        near = ote["inside"] or (best is not None and best["bottom"] <= ote["top"] and best["top"] >= ote["bottom"])
+        checks.append(_check("ote", 3, "Entry in the 62–79% OTE retracement", bool(near), 4,
+                             f"price is {ote['retrace_pct']:.0f}% into the retrace" + (" — inside OTE" if ote["inside"] else "")))
+    else:
+        checks.append(_check("ote", 3, "Entry in the 62–79% OTE retracement", None, 4, "no OTE leg in the trade direction"))
 
     # STEP 4 — trigger on the entry TF --------------------------------------
     avg_body = (sum(abs(c["close"] - c["open"]) for c in entry[-21:-1]) / 20) or atr_e * 0.3
@@ -745,6 +781,7 @@ def panel_payload(tf: str, candles: List[dict], analysis: Optional[Dict] = None,
         "eq": an.get("eq", []),
         "pd": an.get("pd"),
         "trendlines": an.get("trendlines", []),
+        "amd": an.get("amd"), "ote": an.get("ote"), "breakers": an.get("breakers", []),
         "bias": (an.get("bias") or {}).get("bias", "neutral"),
         "atr": an.get("atr", 0),
         "barMs": ms,

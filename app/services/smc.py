@@ -926,7 +926,8 @@ def analyze_full(candles: List[dict], window: int = SMC_WINDOW) -> Dict:
     if len(candles) < 30:
         return {"empty": True, "atr": 0.0, "order_blocks": [], "fvgs": [], "sd_zones": [],
                 "structure": {"swings": [], "trend": "ranging"}, "breaks": {"events": [], "trend": None},
-                "sweeps": [], "poi": [], "retests": [], "eq": [], "pd": None, "trendlines": []}
+                "sweeps": [], "poi": [], "retests": [], "eq": [], "pd": None, "trendlines": [],
+                "amd": None, "ote": None, "breakers": []}
     order_blocks = find_order_blocks(candles, max_blocks=8)
     fvgs = find_fair_value_gaps(candles, max_gaps=10)
     sd_zones = find_supply_demand_zones(candles, max_zones=5)
@@ -946,4 +947,11 @@ def analyze_full(candles: List[dict], window: int = SMC_WINDOW) -> Dict:
         "atr": calc_atr(candles),
     }
     snap["bias"] = bias_state(snap)
+    try:                                           # time-based levels / AMD, OTE and breaker blocks
+        from . import concepts
+        snap["amd"] = concepts.key_levels(candles)
+        snap["ote"] = concepts.find_ote(candles, all_swings)
+        snap["breakers"] = concepts.find_breakers(candles, order_blocks)
+    except Exception:                              # never let an extra concept break the core read
+        snap["amd"], snap["ote"], snap["breakers"] = None, None, []
     return snap

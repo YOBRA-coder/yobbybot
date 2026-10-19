@@ -15,7 +15,7 @@ DEFAULTS: Dict = {
     "consensus": False, "weighting": "equal",
     "rr_intraday": None, "rr_scalp": None, "sl_buffer": None, "gate_sweep": None, "gate_killzone": None,
     "risk_guard": None, "max_chase_atr": None, "min_room_rr": None, "max_risk_pct": None,
-    "rsi_guard": None, "vol_guard": None, "avoid_weekend": None,
+    "rsi_guard": None, "vol_guard": None, "avoid_weekend": None, "gate_amd": None,
     "profiles": {},          # per-pair tuned settings from the backtest optimizer: {"BTCUSDT": {...}}
 }
 _ready = False
@@ -89,14 +89,14 @@ def clean(patch: Dict) -> Dict:
             v = _num(v, 0.3, 10.0)
         elif k == "profiles":
             v = clean_profiles(v)
-        elif k in ("consensus", "gate_sweep", "gate_killzone", "rsi_guard", "vol_guard", "avoid_weekend"):
+        elif k in ("consensus", "gate_sweep", "gate_killzone", "rsi_guard", "vol_guard", "avoid_weekend", "gate_amd"):
             v = None if v is None else bool(v)
         out[k] = v
     return out
 
 
 PROFILE_KEYS = ("sens", "min_agree", "entry_tf", "mode", "rr_intraday", "rr_scalp", "sl_buffer", "gate_sweep", "gate_killzone",
-                "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
+                "risk_guard", "max_chase_atr", "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend", "gate_amd")
 
 
 def clean_profiles(v) -> Dict:
@@ -150,5 +150,5 @@ def set_(patch: Dict) -> Dict:
 
 def custom_opts(cfg: Dict) -> Dict:
     keys = ("rr_intraday", "rr_scalp", "sl_buffer", "gate_sweep", "gate_killzone", "risk_guard", "max_chase_atr",
-            "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend")
+            "min_room_rr", "max_risk_pct", "rsi_guard", "vol_guard", "avoid_weekend", "gate_amd")
     return {k: cfg[k] for k in keys if cfg.get(k) is not None}
